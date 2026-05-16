@@ -17,7 +17,7 @@
 - 生成 AI が誤りにくい API 設計（hallucination 耐性）
 - **途中で止まったマイグレーションを安全に再開できる**（idempotent / resumable, §9）
 - **大量データ更新を checkpoint で再開可能に扱える**（§9.5）
-- **ユーザ定義のカスタム step** が一級市民（`op.step`, §9.6）
+- **ユーザ定義のカスタム step** が一級市民（`op.step`, §9.14）
 - **既存 Alembic プロジェクトからの移行ツールを最初から提供**（§14）
 - MySQL/MariaDB、PostgreSQL、SQLite を初期サポート
 - **同一マイグレーションファイルで複数 DB エンジンを跨いで動作可能**（必須要件）
@@ -206,7 +206,7 @@ Alembic の `batch_alter_table` と同思想だが、明示性を高めた設計
 def upgrade():
     op.add_column("users", "email_normalized", t.Text)
 
-    def normalize(conn, dialect):
+    def normalize(conn, dialect, checkpoint):
         # SQLAlchemy Connection が渡される。アプリのモデルも import 可能
         conn.execute(text("UPDATE users SET email_normalized = LOWER(email)"))
         if dialect.name == "postgresql":
@@ -218,7 +218,7 @@ def upgrade():
 ```
 
 - DDL とデータ移行が **同じトランザクション内に並ぶ**（Alembic の最大の強み）
-- 関数は `(connection, dialect)` を受け取る
+- 関数は `(connection, dialect, checkpoint)` を受け取る（`checkpoint` の詳細は §9.5 / §9.15）
 - アプリの SQLAlchemy モデルを `import` しても OK（ただし「現時点のモデル」になる点は注意 — 後述）
 
 ---
@@ -809,12 +809,13 @@ Step 4: ALTER TABLE ADD col3   → 未実行で停止
 
 「失敗 step 以前の fingerprint 変更を ERROR にする」のは大事。step 1 を勝手に書き換えて再実行すると、DB の col1 が既に存在するため ensure で skip → 変更が反映されない、という silent な事故になる。
 
-### 9.11 Failed migration がある時の後続 migration
+### 9.11 Failed / paused migration がある時の後続 migration
 
-migration X が `failed` のとき、別の migration Y を実行するか？
+migration X が `failed` または `paused` のとき、別の migration Y を実行するか？
 
-- **デフォルト: halt**。failed が 1 つでもあれば `joryu apply` は何もせず終了し、`joryu status` を見るよう促す
-- **明示許可**: `joryu apply --continue-past-failed` で、failed に depends_on で繋がっていない migration のみ実行
+- **デフォルト: halt**。`failed` または `paused` が 1 つでもあれば `joryu apply` は何もせず終了し、`joryu status` を見るよう促す。終了コードは `failed` があれば `2`、`paused` のみであれば `3`（両方ある場合は `2` を優先 — failed の方が解決優先度が高い）
+- **`failed` の明示許可**: `joryu apply --continue-past-failed` で、failed に depends_on で繋がっていない migration のみ実行（`paused` には適用されない — `paused` は復帰可能なため迂回ではなく再開を期待する設計）
+- **`paused` の処理**: `joryu apply --retry-paused [--retry-interval=N]` で paused migration の再開を試行。再開できなかった (依然 paused) 場合は exit code 3 で終了。後続 migration の自動迂回は無い（明示的に skip したいなら `joryu mark <id> --as=failed` で failed に遷移させた後 `--continue-past-failed` を使う）
 - 理由: 失敗は例外イベント。気付かないうちに別 migration が動いて状態が複雑化することを避ける
 
 ### 9.12 Downgrade の現実と AI フレンドリーなアプローチ
@@ -999,6 +1000,38 @@ op.declare_schema_change(
 )
 ```
 
+各 keyword の引数 tuple 形:
+
+| キーワード | tuple 形 |
+|---|---|
+| `column_added` | `(table, column_name, type, opts: dict)` |
+| `column_dropped` | `(table, column_name)` |
+| `column_altered` | `(table, column_name, {"old": ..., "new": ...})` — `old` / `new` は `{"type": ..., "nullable": ..., "default": ...}` の dict |
+| `column_renamed` | `(table, old_name, new_name)` |
+| `table_added` | `(table_name, {"columns": [...], "options": {...}})` |
+| `table_dropped` | `(table_name,)` |
+| `table_renamed` | `(old_name, new_name)` |
+| `index_added` | `(index_name, table, [columns], opts: dict)` |
+| `index_dropped` | `(index_name, table)` |
+| `constraint_added` | `(constraint_name, table, {"kind": "fk"\|"unique"\|"check", ...kind 別 fields})` — fk なら `referred_table` / `referred_columns` / `local_columns`、unique なら `columns`、check なら `expression` |
+| `constraint_dropped` | `(constraint_name, table, {"kind": ...})` |
+| `extension_added` / `extension_dropped` | `(name,)` |
+| `enum_added` | `(name, [labels])` |
+| `enum_dropped` | `(name,)` |
+| `enum_value_added` | `(name, label, {"before": neighbor}\|{"after": neighbor}\|{})` |
+| `view_added` / `materialized_view_added` | `(name, sql)` |
+| `view_dropped` / `materialized_view_dropped` | `(name,)` |
+| `trigger_added` | `(name, table, definition_sql)` |
+| `trigger_dropped` | `(name, table)` |
+| `policy_added` | `(name, table, definition_sql)` |
+| `policy_dropped` | `(name, table)` |
+| `sequence_added` / `sequence_dropped` | `(name,)` |
+| `schema_added` / `schema_dropped` | `(name,)` |
+
+複数同じ keyword を一度に宣言したいときは値を tuple の list にする（`column_added=[(...), (...)]`）。
+
+**v1 で意図的に未収録**: `index_renamed`（Operations API に `op.rename_index` が無いため。raw SQL で index rename を行う場合は `column_renamed` 同様の独自宣言は v2 以降で検討）。
+
 ### 9.14 ユーザ定義 step (`op.step`)
 
 > Migration は「op を順に並べた step 列」だが、ユーザが任意の処理を 1 step として登録できる。
@@ -1020,11 +1053,28 @@ def wait_for_replication(conn, dialect, checkpoint):
     raise op.PauseStep(f"replica lag={lag}s, retry later")
 ```
 
-`op.step(fn)` は decorator または直接呼び出しで使える:
+`op.step` は 3 つの呼び出し形をサポートする:
 ```python
-op.step(my_func)              # 関数を渡す
-op.step(my_func, name="...")  # name を上書き
+@op.step                                       # bare decorator
+def my_func(conn, dialect, checkpoint): ...
+
+@op.step(name="...", description="...")        # decorator factory（メタデータ指定）
+def my_func(conn, dialect, checkpoint): ...
+
+op.step(my_func, name="...", description="...")  # 直接呼び出し（既存関数の登録）
 ```
+
+**返り値**: いずれの形も **元の関数オブジェクトをそのまま返す**（登録は副作用として registry に積むだけ）。これにより:
+- デコレートされた関数はテストから直接呼び出せる (`my_func(conn, dialect, checkpoint)`)。
+- `inspect.iscoroutinefunction(my_func)` の判定が壊れない（§9.14.2 の sync/async 振り分けに必要）。
+- `@op.step` と `@op.step(...)` で型シグネチャが異ならない（decorator factory も `Callable[F, F]` を返す）。
+
+- `name`: step の識別子・`joryu status` 等の表示名（既定は関数名）
+- `description`: `describe()` が返す 1 行説明（既定は docstring の 1 行目、無ければ name）
+- 実行時の判別ロジック:
+  1. 位置引数が 1 つあり、それが callable なら **bare decorator もしくは直接呼び出し** として扱い、その関数を即時登録（両者は意味的に同じ — `@op.step` も `op.step(fn)` も同等の登録呼び出しになる）。
+  2. 位置引数が無くキーワード引数 (`name=` / `description=`) のみなら **decorator factory** として扱い、関数を受け取る wrapper を返す。
+  3. 上記いずれにも当てはまらない呼び出しは即時 `TypeError`。
 
 #### 9.14.2 シグネチャと返り値
 
@@ -1057,6 +1107,11 @@ async def wait_for_webhook(conn, dialect, checkpoint):
 - TaskGroup 等の structured concurrency が綺麗
 - 同期コードを async runner 内から `anyio.from_thread.run_sync` で呼べる相互運用性
 
+**呼び出し側のイベントループ前提**: joryu の CLI / API は同期コンテキストから呼ばれることを前提とし、async step は内部で `anyio.run(...)` を使って独自のイベントループを起動する。
+- 呼び出し側が既に async ランタイム上 (FastAPI background task、`pytest-anyio`、Jupyter 等) で `joryu.apply()` を実行する場合、`anyio.run()` は `RuntimeError: nested event loops` で失敗する。
+- そのケースでは `await joryu.apply_async(...)` を使うこと（v1 で提供）。`apply_async` は呼び出し側のループを再利用し、内部 step を直接 `await` する。
+- nesting を黙って許容するための `nest_asyncio` 系パッチは採用しない（デバッグ困難な挙動の温床になるため）。
+
 返り値の意味:
 
 | 返り値 | 意味 | step status |
@@ -1071,7 +1126,9 @@ async def wait_for_webhook(conn, dialect, checkpoint):
 
 - `conn` は引数で渡される（sync: SQLAlchemy `Connection`、async: `AsyncConnection`）
 - 自分で engine を作りたい場合は `op.get_engine()` でアクセス可能（同じ DB 接続情報）
-- transaction 制御は migration の `transaction_mode` に従う。step 内で明示的に transaction を切りたければ `with conn.begin():` を書く
+- transaction 制御は migration の `transaction_mode` に従う。step 内で明示的に transaction を切りたければ:
+  - sync step: `with conn.begin():`
+  - async step: `async with conn.begin():`（`AsyncConnection` は async context manager のみサポート。sync 構文は `TypeError` になる）
 
 #### 9.14.4 通常の op との違い
 
@@ -1172,14 +1229,30 @@ Choose [1-5]:
 
 これにより事前に「全 5 step」と表示でき、進捗バーが正確になる。
 
+**Registration phase での `op.dialect`**:
+- registration では実 connection を握らず、`op.dialect` は接続対象の dialect 名 (`postgresql` / `mysql` / `sqlite`) を返す read-only な値として振る舞う。これにより `if op.dialect.name == "postgresql":` の分岐が registration でも正しく評価される。
+- 接続情報からの dialect 名のみが利用可能。`conn.execute(...)` 等の実クエリは registration phase では `RuntimeError` を投げる（実 DB アクセスは execution phase に限定）。
+- ただし `op.run_python` / `op.step` の本体は registration では呼ばれない（関数オブジェクトを registry に積むだけ）。そのため `run_python` / `op.step` の中身に dialect 分岐がある場合、step 単位の数は確定するが内部の op 数は事前に出せない。`describe()` 出力にもこの旨が反映される（「run_python: backfill（内部進捗は実行時）」）。
+- `upgrade()` 本体に副作用（外部 API 呼び出しやファイル IO）を書くと registration 時にも実行される。これは禁止し、`joryu verify` で静的に検知する（§7）。
+
 #### 9.17.2 表示モード
 
 | モード | トリガ | 出力 |
 |---|---|---|
-| **interactive** | TTY 検出 (`sys.stdout.isatty()`) | rich-style の live progress（step バー + 現在/次の op） |
-| **plain** | 非 TTY (CI ログ等) | 1 行 1 イベントの行指向ログ |
-| **json** | `--json` 明示 | JSONL 構造化ログ（外部監視向け） |
+| **auto** (既定) | フラグ無し。TTY なら interactive、それ以外は plain に自動切替 | 環境依存 |
+| **interactive** | `--interactive` または auto + TTY | rich-style の live progress（step バー + 現在/次の op） |
+| **plain** | `--plain` または auto + 非 TTY | 1 行 1 イベントの行指向ログ |
+| **json** | `--json` | JSONL 構造化ログ（外部監視向け） |
 | **quiet** | `--quiet` | 失敗時のみ |
+
+CLI フラグは排他的 (`--interactive` / `--plain` / `--json` / `--quiet` は最大 1 つ指定可能)。同時指定は ERROR。指定なしは `auto`。
+
+**スコープ**: 進捗フラグを受け付けるのは長時間出力を行う `joryu apply` / `joryu test` / `joryu import alembic` の 3 つ。その他のサブコマンド (`status` / `show` / `verify` 等) は短時間で結果を返すため進捗フラグを受け付けない（指定すると ERROR）。`--json` のみは全コマンドで受理し、結果を JSONL で出力する（外部監視向け）。
+
+**`--interactive` と `--non-interactive` の関係**: この 2 つは直交した別系統の制御である。
+- `--interactive` / `--plain` / `--json` / `--quiet` は **進捗表示モード** を制御する (§9.17.2)
+- `--non-interactive` は **失敗時の対話プロンプト** を抑制する (§9.16) — 進捗表示には影響しない
+- 同時指定は許可される (例: `joryu apply --non-interactive --interactive` は「CI モードだが rich progress を出す」という妥当な組み合わせ)
 
 #### 9.17.3 表示例
 
@@ -1226,14 +1299,26 @@ joryu apply
 ```python
 @op.step
 def backfill(conn, dialect, checkpoint):
-    total = conn.execute(text("SELECT COUNT(*) FROM users WHERE ...")).scalar()
+    batch_size = 5_000
+    # total は最初の 1 回だけ確定して checkpoint に保存。
+    # 再開時に WHERE が処理済み行を除外して COUNT が縮むのを防ぐ。
+    total = checkpoint.get("total")
+    if total is None:
+        total = conn.execute(text("SELECT COUNT(*) FROM users WHERE ...")).scalar()
+        checkpoint.set("total", total)
     done = checkpoint.get("done", 0)
-    while not_finished:
-        # ... batch work ...
-        done += batch_size
-        checkpoint.set("last_id", cursor)
+    cursor = checkpoint.get("last_id", 0)
+    while done < total:
+        # ... batch work that advances `cursor` and processes up to batch_size rows.
+        # 処理した行数を実測して done に加算（最終 batch では batch_size より少ないことに注意）
+        processed = run_one_batch(conn, cursor, batch_size)  # returns (new_cursor, rows_done)
+        cursor, rows_done = processed
+        done += rows_done
+        checkpoint.update({"last_id": cursor, "done": done})
         checkpoint.report(percent=done * 100 // total,
                           message=f"processed {done}/{total}")
+        if rows_done == 0:
+            break  # 安全網: もう処理対象が無い
     return True
 ```
 
@@ -1254,7 +1339,7 @@ def wait_for_replication(conn, dialect, checkpoint):
 
 `joryu down` のような破壊的コマンドを誤って本番で実行しないための判定方針:
 
-#### 9.17.1 自動判定 (heuristic)
+#### 9.18.1 自動判定 (heuristic)
 
 DB 接続文字列に以下のいずれかを含むなら **ローカル**と推定:
 - `localhost` / `127.0.0.1` / `::1`
@@ -1265,7 +1350,7 @@ DB 接続文字列に以下のいずれかを含むなら **ローカル**と推
 
 それ以外は **production-like** と判定し、`joryu down` は `--allow-prod` 必須。
 
-#### 9.17.2 明示宣言
+#### 9.18.2 明示宣言
 
 設定ファイルや init API で本番宣言:
 ```python
@@ -1283,7 +1368,7 @@ environment = "production"            # local / staging / production
 - `joryu apply`: `--continue-past-failed` がより慎重なプロンプトを出す
 - `joryu mark`: 確認プロンプト
 
-#### 9.17.3 ドキュメント方針
+#### 9.18.3 ドキュメント方針
 
 manual に「本番環境の判定方法」専用セクションを置き、heuristic の限界、明示宣言の推奨、CI/CD への組み込み方を網羅する。誤判定が事故にも利便性低下にもなるため、判定の透明性が重要。
 
@@ -1297,7 +1382,7 @@ joryu generate <slug> [--empty] [--against=db|replay]
 joryu apply [--target=<id>] [--dry-run] [--no-resume] [--continue-past-failed]
                                         #   [--non-interactive --on-failure=resume|restart|abort]
                                         #   [--retry-paused --retry-interval=30s]
-                                        #   [--quiet | --json]                         # 進捗表示モード (§9.17)
+                                        #   [--interactive | --plain | --json | --quiet]  # 進捗表示モード (§9.17、既定 auto)
 joryu status                            # 適用済み/未適用/失敗/paused 一覧、step 進捗付き
 joryu down [--steps=N | --to=<id>] [--allow-prod]   # dev 専用、production-like 接続は明示許可必須
 joryu schema-snapshot [--format=json|sql]           # AI 補助用に現在 schema を出力
@@ -1311,6 +1396,66 @@ joryu test [--unit | --integration] [--dialects=postgresql,mysql,sqlite]
 joryu import alembic --alembic-dir=./alembic --output-dir=./migrations
                                         #   [--migrate-state] [--drop-alembic-table] [--report]
 ```
+
+### 10.1 Python API エントリポイント
+
+CLI と等価な Python API を v1 で提供する。test harness、デプロイスクリプト、async web framework からの組み込み用途。
+
+```python
+import joryu
+
+# 同期 API（CLI と等価。内部で anyio.run を起動）
+joryu.apply(target=None, dry_run=False, no_resume=False, continue_past_failed=False,
+            non_interactive=False, on_failure="resume",
+            retry_paused=False, retry_interval="30s",
+            output="auto")      # "auto" | "interactive" | "plain" | "json" | "quiet" — 詳細は §9.17.2
+joryu.status()
+joryu.down(steps=None, to=None, allow_prod=False)
+joryu.verify()
+joryu.generate(slug, empty=False, against="db")
+
+# Async API（呼び出し側が既にイベントループ上にいる場合）
+await joryu.apply_async(...)    # 上記 apply と同シグネチャ、`await` 必須
+await joryu.down_async(steps=None, to=None, allow_prod=False)  # 上記 down と同シグネチャ
+```
+
+- 同期 API は `anyio.run(...)` で内部ループを起動する。既存ループ上から呼ぶと `RuntimeError`。
+- async API は呼び出し側ループを再利用し、async step を直接 `await` する。
+- どちらも CLI と同じ exit code 規約 (§10.2) に従い、失敗は §10.3 の例外で通知する。
+
+### 10.2 Exit code
+
+CLI / API 共通の終了ステータス:
+
+| code | 意味 | 対応例外 (Python API) |
+|---|---|---|
+| `0` | 成功 | — |
+| `1` | 一般エラー（unexpected exception、引数誤り等） | `JoryuError` (base) |
+| `2` | Migration 失敗（apply 中に step がエラー終了） | `MigrationFailed` |
+| `3` | Migration 一時停止（`PauseStep` 発火、または `--retry-paused` でも復帰せず、または既存 paused migration に阻まれて halt） | `MigrationPaused` |
+| `4` | Verify 失敗（drift / 競合検出） | `VerificationFailed` |
+| `5` | Production guard により拒否（`--allow-prod` 未指定で本番判定された） | `ProductionGuardError` |
+
+### 10.3 公開例外クラス
+
+`joryu` パッケージから直接 import 可能な例外:
+
+```python
+joryu.JoryuError                     # 全例外の基底
+├── MigrationFailed(migration_id, step_index, step_name, cause)
+├── MigrationPaused(migration_id, step_index, step_name, reason)
+├── VerificationFailed(conflicts: list[Conflict])
+└── ProductionGuardError(detected_env: Literal["staging", "production", "production-like"], host: str | None)
+```
+
+- `MigrationFailed.cause` には元の例外を保持（chain 経由ではなく属性で参照可能）
+- `MigrationPaused` は `PauseStep` が `op.step` または `op.run_python` から送出された場合に top-level で raise される（§9.14.2 のステップレベル signal と対）
+- `VerificationFailed.conflicts` は §7 の Conflict オブジェクトのリスト
+- `ProductionGuardError.detected_env`:
+  - 明示宣言があった場合 (§9.18.2 の `joryu.set_environment(...)` または `joryu.toml`) はその文字列 (`"staging"` / `"production"`)
+  - heuristic で本番判定された場合は `"production-like"`（local 判定は false なので例外を投げない）
+  - `host` は接続文字列から抽出したホスト名（SQLite ファイルパス等で取得できないときは `None`）
+- いずれも `str(exc)` で人間可読な要約を返す
 
 ---
 
@@ -1427,7 +1572,7 @@ joryu import alembic --migrate-state
 - ✅ **Alembic 移行ツール**: v1 から提供 (§13)
 - ✅ **`joryu test` の実装**: unit (in-memory) + integration (testcontainers) の二層 (§6.4)
 - ✅ **中途半端な失敗の扱い**: インタラクティブな 5 択プロンプト (§9.16)
-- ✅ **本番判定**: heuristic + 明示宣言の二段構え (§9.17)
+- ✅ **本番判定**: heuristic + 明示宣言の二段構え (§9.18)
 - ✅ **checkpoint API 詳細**: §9.15 で完全仕様化
 - ✅ **op.step ユーザ定義 step**: §9.14 で仕様化
 
