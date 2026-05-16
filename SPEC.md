@@ -972,7 +972,32 @@ def upgrade():
 - `joryu generate` は warning を出す: "historical schema may be stale after migration X due to undeclared raw SQL"
 - ただしエラーにはしない（最も多くの run_python はデータ変更のみで schema 影響なし）
 
-`op.declare_schema_change(...)` の引数は `op.add_column` 等と同じ語彙のサブセット（`column_added`, `column_dropped`, `index_added`, `extension_added`, `table_added`, `table_dropped` など）。
+`op.declare_schema_change(...)` の引数は `op.add_column` 等と同じ語彙のサブセット。
+
+**v1 で固定の語彙**:
+
+| カテゴリ | キーワード |
+|---|---|
+| Column | `column_added`, `column_dropped`, `column_altered`, `column_renamed` |
+| Table | `table_added`, `table_dropped`, `table_renamed` |
+| Index | `index_added`, `index_dropped` |
+| Constraint | `constraint_added`, `constraint_dropped` (kind=`fk`\|`unique`\|`check`) |
+| Extension (PG) | `extension_added`, `extension_dropped` |
+| Enum | `enum_added`, `enum_dropped`, `enum_value_added` |
+| View | `view_added`, `view_dropped` |
+| Materialized View | `materialized_view_added`, `materialized_view_dropped` |
+| Trigger | `trigger_added`, `trigger_dropped` |
+| RLS Policy | `policy_added`, `policy_dropped` |
+| Sequence | `sequence_added`, `sequence_dropped` |
+| Schema (PG) | `schema_added`, `schema_dropped` |
+
+語彙は v1 で固定（破壊的変更しない）。後方互換で追加は可能。複数 keyword を 1 回の呼び出しで渡せる:
+```python
+op.declare_schema_change(
+    column_added=("users", "api_key", t.Text, {"nullable": False, "generated": True}),
+    index_added=("idx_users_api_key", "users", ["api_key"], {"unique": True}),
+)
+```
 
 ### 9.14 ユーザ定義 step (`op.step`)
 
@@ -1004,8 +1029,33 @@ op.step(my_func, name="...")  # name を上書き
 #### 9.14.2 シグネチャと返り値
 
 シグネチャ: `fn(conn, dialect, checkpoint) -> bool | None`
-- 同期関数 / `async def` の両方サポート（`inspect.iscoroutinefunction` で判別、必要に応じて `asyncio.run`）
+- **同期関数が一級市民**: SQLAlchemy Core/ORM を使う通常のクエリ実行が想定される最頻パターン
+- **`async def` も対応**: 外部 IO 待機 (HTTP 呼び出し、replication 待ち等) で必要なケース
+- 判別: `inspect.iscoroutinefunction(fn)` → True なら **anyio** runner で実行、False ならそのまま同期実行
 - 引数を不要なら `*args, **kwargs` で受けて無視するか、`fn()` のような無引数定義も許可
+- 同一 migration 内に sync / async step を混在可
+
+```python
+# Sync (典型、SQLAlchemy)
+@op.step
+def normalize_user_data(conn, dialect, checkpoint):
+    rows = conn.execute(select(User).where(User.normalized.is_(None))).all()
+    for r in rows:
+        conn.execute(update(User).where(User.id == r.id).values(normalized=r.name.lower()))
+    return True
+
+# Async (外部 IO)
+@op.step
+async def wait_for_webhook(conn, dialect, checkpoint):
+    async with httpx.AsyncClient() as c:
+        r = await c.get("https://...")
+    return r.status_code == 200
+```
+
+**runtime 選定**: 内部実装は **anyio** を使う（asyncio 直接ではない）。理由:
+- asyncio + trio の両対応で将来性
+- TaskGroup 等の structured concurrency が綺麗
+- 同期コードを async runner 内から `anyio.from_thread.run_sync` で呼べる相互運用性
 
 返り値の意味:
 
@@ -1110,7 +1160,97 @@ Choose [1-5]:
 - `[3]` 全消去はチェックポイントを破棄、ensure semantics の op は再実行で skip されるが run_python は最初から走る → ユーザの WHERE 句が冪等であれば安全
 - `[4]` skip はメタ情報として記録され、後で `joryu status` で見える
 
-### 9.17 本番判定とローカル安全策
+### 9.17 リアルタイム進捗表示
+
+> Migration 実行中に何が起きているかが見えないと「止まっている / 進んでいる / どの op か」が分からない。
+> joryu は **op を実行する前に全 step を列挙** できるので（`upgrade()` の registration phase → execution phase に分離）、step 番号・現在の op・次の op・進捗をリアルタイムに出せる。
+
+#### 9.17.1 実行 phase の二段構え
+
+1. **Registration phase**: `upgrade()` を一度実行して `op.*` 呼び出しを registry に登録（実 DB には触れない）。step 数・op 種類・引数が確定
+2. **Execution phase**: 登録された step を順に実行。各 step の start/done/progress イベントを発火
+
+これにより事前に「全 5 step」と表示でき、進捗バーが正確になる。
+
+#### 9.17.2 表示モード
+
+| モード | トリガ | 出力 |
+|---|---|---|
+| **interactive** | TTY 検出 (`sys.stdout.isatty()`) | rich-style の live progress（step バー + 現在/次の op） |
+| **plain** | 非 TTY (CI ログ等) | 1 行 1 イベントの行指向ログ |
+| **json** | `--json` 明示 | JSONL 構造化ログ（外部監視向け） |
+| **quiet** | `--quiet` | 失敗時のみ |
+
+#### 9.17.3 表示例
+
+**Interactive (TTY)**:
+```
+joryu apply
+
+▶ 20260620T030000_backfill_email_normalized  (5 steps, transaction_mode=per_step)
+  ✓ 1/5  add_column users.email_normalized               (0.02s)
+  ✓ 2/5  create_index tmp_users_unnormalized              (1.4s)
+  ◐ 3/5  run_python backfill                              (00:42, 30% — last_id=15003421)
+  · 4/5  drop_index tmp_users_unnormalized                pending
+  · 5/5  alter_column users.email_normalized NOT NULL     pending
+```
+
+**Plain (CI)**:
+```
+[joryu] applying 20260620T030000_backfill_email_normalized (5 steps)
+[joryu]   step 1/5: add_column users.email_normalized
+[joryu]   step 1/5: done (0.02s)
+[joryu]   step 2/5: create_index tmp_users_unnormalized
+[joryu]   step 2/5: done (1.4s)
+[joryu]   step 3/5: run_python backfill (starting)
+[joryu]   step 3/5: progress last_id=5000000 (10%)
+[joryu]   step 3/5: progress last_id=10000000 (20%)
+```
+
+**JSON**:
+```jsonl
+{"event":"migration_start","id":"...","steps":5,"transaction_mode":"per_step"}
+{"event":"step_start","step":1,"op":"add_column","description":"users.email_normalized","next":"create_index tmp_users_unnormalized"}
+{"event":"step_done","step":1,"duration_ms":20}
+{"event":"step_progress","step":3,"progress":{"last_id":5000000,"percent":10}}
+{"event":"step_done","step":3,"duration_ms":234000}
+{"event":"migration_done","id":"...","duration_ms":237500}
+```
+
+#### 9.17.4 進捗報告 API
+
+各 op には `describe() -> str` メソッドがあり、1 行説明を返す（autogenerated for built-in ops, customizable for `op.step`）。
+
+`run_python` / `op.step` 内では明示的に進捗を報告できる:
+
+```python
+@op.step
+def backfill(conn, dialect, checkpoint):
+    total = conn.execute(text("SELECT COUNT(*) FROM users WHERE ...")).scalar()
+    done = checkpoint.get("done", 0)
+    while not_finished:
+        # ... batch work ...
+        done += batch_size
+        checkpoint.set("last_id", cursor)
+        checkpoint.report(percent=done * 100 // total,
+                          message=f"processed {done}/{total}")
+    return True
+```
+
+`checkpoint.report(...)` の挙動:
+- TTY モード: 進捗バーを更新（rate limit: 100ms ごとに 1 回まで）
+- Plain モード: 1 秒ごとに 1 回ログ出力
+- JSON モード: `step_progress` イベントを発火
+- 値は永続化されない（一過性の表示用）。永続化したいなら `checkpoint.set(...)` を併用
+
+`op.step` のカスタム description:
+```python
+@op.step(description="wait for replication lag < 1s")
+def wait_for_replication(conn, dialect, checkpoint):
+    ...
+```
+
+### 9.18 本番判定とローカル安全策
 
 `joryu down` のような破壊的コマンドを誤って本番で実行しないための判定方針:
 
@@ -1157,6 +1297,7 @@ joryu generate <slug> [--empty] [--against=db|replay]
 joryu apply [--target=<id>] [--dry-run] [--no-resume] [--continue-past-failed]
                                         #   [--non-interactive --on-failure=resume|restart|abort]
                                         #   [--retry-paused --retry-interval=30s]
+                                        #   [--quiet | --json]                         # 進捗表示モード (§9.17)
 joryu status                            # 適用済み/未適用/失敗/paused 一覧、step 進捗付き
 joryu down [--steps=N | --to=<id>] [--allow-prod]   # dev 専用、production-like 接続は明示許可必須
 joryu schema-snapshot [--format=json|sql]           # AI 補助用に現在 schema を出力
@@ -1290,12 +1431,7 @@ joryu import alembic --migrate-state
 - ✅ **checkpoint API 詳細**: §9.15 で完全仕様化
 - ✅ **op.step ユーザ定義 step**: §9.14 で仕様化
 
-### 残課題
-
-1. **`op.declare_schema_change` の語彙完全性**: §9.13.2 で示した語彙がすべての raw SQL 影響をカバーできるか、漏れがあれば追加
-2. **`joryu import alembic` のエッジケース**: branch labels、複数 head、`bulk_insert`、カスタム migration template の扱い詳細
-3. **integration test の CI 推奨設定**: nightly で動かす GitHub Actions / GitLab CI のテンプレートを公式提供すべきか
-4. **`op.step` の async runtime**: 既存 event loop の中で動く場合の挙動。`anyio` で抽象化するか asyncio 直接か
+### 残課題 (現時点なし — 全項目決着)
 
 ### 後日まとめて対応
 - **SPEC.md の章立て整理 + 目次追加** → 英語化のタイミングで一斉に実施
@@ -1305,6 +1441,17 @@ joryu import alembic --migrate-state
 
 - ✅ **Python バージョン**: 3.11+ (§1 動作環境)
 - ✅ **AI skill 配布**: repository 内 `.claude/skills/joryu/` 同梱 (§1 公式 AI skill 配布)
+- ✅ **`op.declare_schema_change` 語彙 v1 確定** (§9.13.2 末): column/table/index/constraint/extension/enum/view/materialized_view/trigger/policy/sequence/schema の add/drop/altered/renamed
+- ✅ **Alembic import エッジケース方針確定** (§13):
+  - branch labels: 無視（捨てる）
+  - 多 head: 並列 leaf として全取込
+  - merge revision: `depends_on` に複数親
+  - `bulk_insert`: `op.run_python` stub + TODO コメント
+  - カスタム template: warn でスキップ
+- ✅ **CI テンプレート**: GitHub Actions / GitLab CI / pre-commit の 3 種を `examples/ci/` に公式提供
+- ✅ **`op.step` async runtime**: **anyio** で抽象化 (§9.14.2)
+- ✅ **sync `op.step` を一級市民として明示** (§9.14.2): SQLAlchemy Core/ORM が想定最頻パターン
+- ✅ **リアルタイム進捗表示**: registration phase → execution phase の二段構え、TTY/plain/JSON モード、`checkpoint.report()` API (§9.17)
 
 ---
 
