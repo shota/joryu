@@ -1,0 +1,126 @@
+# GitHub Actions workflow for joryu.
+#
+# Drops two jobs into your repository:
+#   - verify-and-test: runs on every pull request; gates merges on
+#     `joryu verify` and `joryu test --unit`.
+#   - apply: runs on push to `main`; applies pending migrations to
+#     the deployment database using DATABASE_URL from secrets.
+#
+# Required repository secrets for the apply job:
+#   DATABASE_URL  — SQLAlchemy URL of the production / staging DB.
+#
+# Copy this file to .github/workflows/joryu.yml in your project.
+
+name: joryu
+
+on:
+  pull_request:
+    paths:
+      - "migrations/**"
+      - "models/**"
+      - "joryu.toml"
+      - ".github/workflows/joryu.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  verify-and-test:
+    name: verify + unit test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install joryu
+        run: |
+          python -m pip install --upgrade pip
+          pip install joryu
+
+      - name: joryu verify
+        id: verify
+        run: joryu verify
+
+      - name: Comment on verify failure
+        if: failure() && steps.verify.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: [
+                '`joryu verify` failed (exit 4).',
+                '',
+                'Two migrations on this branch touch the same schema element.',
+                'See https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId,
+                '',
+                'Fix: rebase the later migration and add `depends_on=["<earlier id>"]`,',
+                'or fold the two migrations into one. Then push again.',
+              ].join('\n')
+            })
+
+      - name: joryu test --unit
+        id: unit_test
+        run: joryu test --unit
+
+      - name: Comment on unit-test failure
+        if: failure() && steps.unit_test.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: [
+                '`joryu test --unit` failed.',
+                '',
+                'The in-memory SQLite apply / re-apply check did not pass.',
+                'Run `joryu test --unit` locally for the full trace, or open the',
+                'Actions log above. Common causes: a non-idempotent op, a missing',
+                '`depends_on`, or a type that is not supported on SQLite.',
+              ].join('\n')
+            })
+
+  apply:
+    name: apply pending migrations
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install joryu
+        run: |
+          python -m pip install --upgrade pip
+          pip install joryu
+
+      - name: joryu status (pre-apply)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: joryu status
+
+      - name: joryu apply
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: joryu apply --non-interactive --on-failure=abort --plain

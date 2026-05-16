@@ -1,0 +1,70 @@
+# GitLab CI pipeline for joryu.
+#
+# Three jobs:
+#   - verify: runs on every merge request; gates merges on
+#     `joryu verify` (exit 4 means a parallel-PR conflict).
+#   - test:unit: runs on every merge request; in-memory SQLite
+#     apply / re-apply check.
+#   - apply: manual job that runs `joryu apply` against the
+#     deployment DB. Triggered from the GitLab UI for controlled
+#     production rollouts.
+#
+# Required CI/CD variables for the apply job:
+#   DATABASE_URL  — SQLAlchemy URL of the target environment.
+#
+# Copy this file to .gitlab-ci.yml in your project root.
+
+stages:
+  - verify
+  - test
+  - deploy
+
+default:
+  image: python:3.11-slim
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/pip
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install --cache-dir .cache/pip joryu
+
+verify:
+  stage: verify
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - joryu verify
+  # Exit codes (SPEC §16.2):
+  #   4 → semantic conflict (rebase + add depends_on)
+  #   2 → migration failure, 3 → paused, 5 → production guard
+
+test:unit:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - joryu test --unit
+  artifacts:
+    when: on_failure
+    paths:
+      - .joryu/
+    expire_in: 1 week
+
+apply:production:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  environment:
+    name: production
+    url: $PRODUCTION_URL
+  variables:
+    DATABASE_URL: $DATABASE_URL
+  script:
+    - joryu status
+    - joryu apply --non-interactive --on-failure=abort --plain
+  # If joryu apply fails the pipeline fails with the underlying
+  # exit code (2 = step failed, 3 = paused, 5 = production guard).

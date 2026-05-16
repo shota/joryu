@@ -1,0 +1,40 @@
+# pre-commit hook for joryu.
+#
+# Runs `joryu verify` on every commit so semantic conflicts and
+# checksum violations surface before they reach CI.
+#
+# Wiring:
+#   1. Install pre-commit:           pip install pre-commit
+#   2. Copy this file to your repo:  cp examples/ci/pre-commit.yaml .pre-commit-config.yaml
+#   3. Install the git hook:         pre-commit install
+#
+# For the optional pre-push `joryu test --unit` hook, also run:
+#   pre-commit install --hook-type pre-push
+#
+# `joryu` itself does not publish a hook repository, so the hooks
+# below use `repo: local` and shell out to the installed CLI.
+# Both hooks assume `joryu` is on PATH (i.e. installed in the same
+# virtualenv pre-commit is invoked from, or globally).
+
+repos:
+  - repo: local
+    hooks:
+      # Runs on every commit: fast static analysis + checksum check.
+      - id: joryu-verify
+        name: joryu verify (semantic conflicts + checksum)
+        entry: joryu verify
+        language: system
+        pass_filenames: false
+        files: ^(migrations/|models/|joryu\.toml$)
+        stages: [commit]
+
+      # Optional: runs on `git push` only — heavier (in-memory SQLite
+      # apply / re-apply). Enable by running `pre-commit install
+      # --hook-type pre-push` once, in addition to `pre-commit install`.
+      - id: joryu-test-unit
+        name: joryu test --unit (in-memory apply/re-apply)
+        entry: joryu test --unit
+        language: system
+        pass_filenames: false
+        files: ^(migrations/|models/|joryu\.toml$)
+        stages: [push]
