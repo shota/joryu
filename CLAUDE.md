@@ -2,16 +2,15 @@
 
 ## Language policy
 
-- **All artifacts in this repository are written in English** by default. This includes:
+- **All artifacts in this repository are written in English**. This includes:
   - Source code, comments, docstrings
-  - Documentation (READMEs, design docs, ADRs, contributor guides)
+  - Documentation (READMEs, design docs, ADRs, contributor guides, `SPEC.md`)
   - Commit messages, PR descriptions
   - Issue titles and bodies
   - Error messages and log output
   - CLI help text
   - Generated migration file boilerplate (including `JORYU-DOWN-HINT:` comments)
-- **Sole exception**: `SPEC.md` is written in Japanese while the design is being negotiated with the maintainer. Once the spec is frozen, it will be translated to English alongside the rest of the docs.
-- When asked to "write a doc / readme / comment / message," produce English output unless the request explicitly mentions `SPEC.md` or asks for Japanese.
+- When asked to "write a doc / readme / comment / message," produce English output.
 - When editing code or docs, do not introduce mixed-language comments — match the language of the surrounding file.
 
 ## Project context

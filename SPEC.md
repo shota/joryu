@@ -1,84 +1,108 @@
-# joryu 仕様書（draft v1）
+# joryu Specification (draft v1)
 
-> Alembic に代わる、SQLAlchemy ベースの Python マイグレーションライブラリ。
-> 設計議論のたたき台。実装前に固める。
+> A SQLAlchemy-based Python migration library, intended as a modern alternative to Alembic.
+> This document is the working design spec; finalize it before implementation.
 
----
+## Table of contents
 
-## 1. ゴールと非ゴール
-
-### ゴール
-- SQLAlchemy モデルの差分を読み取り、マイグレーションファイルを自動生成する
-- 複数 PR の同時進行で **暗黙的な順序衝突を起こさない**（並走安全）
-- マイグレーションは「DB 上の `joryu_migrations` テーブルに未登録のものを順次実行」する単純な追記モデル
-- 順序を明示できる。明示が無ければ timestamp 昇順
-- Python の表現力を活かしたデータ移行・条件分岐が一級市民
-- raw SQL を一級市民として書ける（escape hatch）
-- 生成 AI が誤りにくい API 設計（hallucination 耐性）
-- **途中で止まったマイグレーションを安全に再開できる**（idempotent / resumable, §9）
-- **大量データ更新を checkpoint で再開可能に扱える**（§9.5）
-- **ユーザ定義のカスタム step** が一級市民（`op.step`, §9.14）
-- **既存 Alembic プロジェクトからの移行ツールを最初から提供**（§14）
-- MySQL/MariaDB、PostgreSQL、SQLite を初期サポート
-- **同一マイグレーションファイルで複数 DB エンジンを跨いで動作可能**（必須要件）
-
-### 非ゴール
-- 本番環境向けの自動ロールバック（forward-only。dev での巻き戻しは別途）
-- multi-tenant スキーマ切替の自動化
-- スキーマ drift の自動修復
-- 生成 AI 直接モード (`joryu generate --from-prompt "..."`) — **将来も非搭載**。代わりに公式 skill を repository 内に配布（`.claude/skills/joryu/`）し、ユーザのエディタ側 AI が joryu CLI を駆動する形にする
-
-### 動作環境
-- **Python 3.11+** （`tomllib` stdlib / `Self` 型 / Exception Groups / asyncio.TaskGroup / 性能改善を活用）
-- 3.10 は除外（EOL 2026-10）
-- 型ヒント・`match` 文・PEP 604 union 型 (`X | Y`)・`Self` 型を活用したモダンな書き方を志向
-
-### 公式 AI skill 配布
-
-- joryu の **GitHub repository 内** に `.claude/skills/joryu/` を含める形で配布
-- スキルの内容: `joryu generate` / `apply` / `down` 完成 / `verify` 等の CLI を AI が呼べるよう手順を記述
-- ユーザは自分のプロジェクトにスキルをコピー（または submodule / symlink）して使う
-- 将来 VSCode extension 等の独立配布も検討するが、まずは repo 同梱で広く配布
+1. [Goals and non-goals](#1-goals-and-non-goals)
+2. [Architecture overview](#2-architecture-overview)
+3. [Migration file format (option B: Python-first)](#3-migration-file-format-option-b-python-first)
+4. [Operations API](#4-operations-api)
+5. [AI-friendly API design](#5-ai-friendly-api-design)
+6. [Multi-dialect support](#6-multi-dialect-support)
+7. [Parallel PRs and consistency detection](#7-parallel-prs-and-consistency-detection)
+8. [Autogeneration (SQLAlchemy diff)](#8-autogeneration-sqlalchemy-diff)
+9. [Execution model: transactions, idempotency, locking](#9-execution-model-transactions-idempotency-locking)
+10. [Failure handling and resumption](#10-failure-handling-and-resumption)
+11. [Downgrade](#11-downgrade)
+12. [Historical schema replay](#12-historical-schema-replay)
+13. [User-defined steps and checkpoints](#13-user-defined-steps-and-checkpoints)
+14. [Progress display](#14-progress-display)
+15. [Production safety](#15-production-safety)
+16. [CLI](#16-cli)
+17. [Configuration file (`joryu.toml`)](#17-configuration-file-joryutoml)
+18. [Comparison with Alembic and Django](#18-comparison-with-alembic-and-django)
+19. [Alembic migration tool](#19-alembic-migration-tool)
+20. [Design decisions log](#20-design-decisions-log)
+21. [Appendix A: Migration examples](#appendix-a-migration-examples)
 
 ---
 
-## 2. アーキテクチャ全体像
+## 1. Goals and non-goals
+
+### Goals
+- Read diffs from SQLAlchemy models and autogenerate migration files.
+- Concurrent PRs MUST NOT cause implicit ordering conflicts (parallel-safe).
+- Migrations follow a simple append model: "execute everything in `joryu_migrations` that isn't yet recorded in the DB."
+- Ordering can be made explicit; otherwise it defaults to timestamp ascending.
+- Python's expressive power for data migrations and conditional logic is first-class.
+- Raw SQL is first-class (escape hatch).
+- API designed to resist LLM hallucination.
+- A migration interrupted mid-flight can be safely resumed (idempotent / resumable, §9).
+- Bulk data updates are checkpointable and resumable (§13.1).
+- User-defined custom steps are first-class (`op.step`, §13.2).
+- A migration tool for existing Alembic projects ships from day one (§19).
+- Initial support for MySQL/MariaDB, PostgreSQL, and SQLite.
+- A single migration file must be able to run across multiple DB engines (hard requirement).
+
+### Non-goals
+- Automated rollback for production (forward-only; dev-time rollback is separate).
+- Automatic multi-tenant schema switching.
+- Automatic schema-drift remediation.
+- A direct generative-AI mode (`joryu generate --from-prompt "..."`) — never shipping. Instead, an official skill is distributed inside the repository (`.claude/skills/joryu/`) so the user's editor-side AI drives the joryu CLI.
+
+### Runtime requirements
+- **Python 3.11+** (uses `tomllib` from stdlib, `Self` type, Exception Groups, `asyncio.TaskGroup`, plus 3.11 performance improvements).
+- 3.10 is excluded (EOL 2026-10).
+- Targets modern Python style: type hints, `match` statements, PEP 604 unions (`X | Y`), `Self`.
+
+### Official AI skill distribution
+
+- Ship `.claude/skills/joryu/` inside the joryu GitHub repository.
+- Skill contents: instructions so an AI can drive `joryu generate` / `apply` / `down` completion / `verify` and other CLI subcommands.
+- Users copy the skill into their project (or use a submodule / symlink).
+- A standalone VSCode extension or similar may be considered later, but the in-repo skill is the primary distribution channel.
+
+---
+
+## 2. Architecture overview
 
 ```
-プロジェクト/
-├── models/                                # SQLAlchemy モデル（ユーザ管理）
+project/
+├── models/                                # SQLAlchemy models (user-managed)
 ├── migrations/
 │   ├── 20260514T093000_add_users.py
 │   ├── 20260515T101200_add_email_index.py
 │   └── 20260516T120000_seed_default_roles.py
-└── joryu.toml                             # プロジェクト設定
+└── joryu.toml                             # project configuration
 ```
 
-- **source of truth**: ユーザの SQLAlchemy `MetaData`
-- **生成物**: `migrations/*.py`（並走 PR の merge を阻害する集中ファイルは置かない）
-- **状態 / 改変検知**: DB 内の `joryu_migrations` テーブル（適用済みファイルの checksum を保持）
-- **意味的競合検知**: `joryu verify` による Operations の静的解析（§7）
+- **Source of truth**: the user's SQLAlchemy `MetaData`.
+- **Produced artifacts**: `migrations/*.py`. No central file that would block PR merges.
+- **State / mutation detection**: the `joryu_migrations` table in the DB (stores per-file checksums of applied migrations).
+- **Semantic conflict detection**: `joryu verify` does static analysis over Operations (§7).
 
 ---
 
-## 3. マイグレーションファイル形式（案 B: Python ファースト）
+## 3. Migration file format (option B: Python-first)
 
-### 3.1 命名規則
+### 3.1 Naming convention
 
 ```
 <UTC timestamp ISO basic>_<slug>.py
-例: 20260514T093000_add_users.py
+example: 20260514T093000_add_users.py
 ```
 
-- timestamp は **UTC・秒精度・ISO basic 形式**（`YYYYMMDDTHHMMSS`）
-- lexicographic 順 = 時系列順
-- スラッグは英小文字 + `_`、最大 60 文字
-- 同秒衝突時はファイル末尾に `_2`, `_3` …
+- The timestamp is UTC, second precision, ISO basic format (`YYYYMMDDTHHMMSS`).
+- Lexicographic order equals chronological order.
+- Slugs are lowercase ASCII plus `_`, up to 60 characters.
+- On a same-second collision, append `_2`, `_3`, … to the filename.
 
-Django の per-app sequence (`0001_*.py`) を採用しない理由: 並走 PR で必ず番号衝突する。
-Alembic のランダム hex を採用しない理由: 人間が読めない・ソート不能。
+Why not Django's per-app sequence (`0001_*.py`): concurrent PRs always collide on the number.
+Why not Alembic's random hex: not human-readable, not sortable.
 
-### 3.2 ファイル本体（デコレータスタイル）
+### 3.2 File body (decorator style)
 
 ```python
 """Add users table."""
@@ -87,7 +111,7 @@ from joryu import op, types as t
 
 @joryu.migration(
     id="20260514T093000_add_users",
-    depends_on=[],                       # 空なら timestamp 昇順
+    depends_on=[],                       # empty means timestamp-ascending order
     transaction_mode="per_step",         # default
     tags=["schema"],
 )
@@ -99,45 +123,47 @@ def upgrade():
         op.column("created_at", t.Timestamp, server_default=op.func.now()),
     )
 
-@joryu.downgrade                          # 任意、dev 用
+@joryu.downgrade                          # optional, dev-only
 def downgrade():
     op.drop_table("users")
 ```
 
-**メタデータ項目** (`@joryu.migration(...)` の引数)
+**Metadata fields** (arguments to `@joryu.migration(...)`):
 
-| 引数 | 必須 | 説明 |
+| Argument | Required | Description |
 |---|---|---|
-| `id` | yes | ファイル名と一致。状態テーブルに記録される論理 ID |
-| `depends_on` | no, default `[]` | 先行マイグレーションの id リスト。空なら timestamp 順 |
-| `transaction_mode` | no, default `"per_step"` | `"per_migration"` / `"per_step"` / `"none"` の三択。詳細は §9.3 |
-| `dialects` | no | 特定方言限定。例: `["postgresql"]` |
-| `tags` | no | 任意ラベル（フィルタ用） |
-| `group` | no | ステップグループの ID。同じ group の migration は一連の論理変更として扱われる（§6 参照） |
-| `on_mismatch` | no, default `"error"` | ensure 時の挙動。詳細は §9.4.2 |
+| `id` | yes | Must match the filename. Logical ID recorded in the state table. |
+| `depends_on` | no, default `[]` | List of predecessor migration IDs. Empty means timestamp order. |
+| `transaction_mode` | no, default `"per_step"` | One of `"per_migration"` / `"per_step"` / `"none"`. See §9.3. |
+| `dialects` | no | Restrict to specific dialects, e.g. `["postgresql"]`. |
+| `tags` | no | Arbitrary labels (for filtering). |
+| `group` | no | Step-group ID. Migrations sharing a `group` are treated as one logical change (see §6). |
+| `on_mismatch` | no, default `"error"` | Behavior on ensure mismatch. See §9.5.2. |
 
-**設計判断: なぜデコレータか**:
-- モダンな Python の慣習（FastAPI / Typer / pytest が広めたパターン）
-- 引数が型ヒント付きなので IDE 補完・型検査が効く
-- 1 ファイル 1 migration の原則がコード上で明示される（複数の `@joryu.migration` を 1 ファイルに書くと ERROR）
-- module-level 属性スタイル（Alembic 風）は廃止
+**Design rationale — why decorators**:
+- Aligned with modern Python idioms (FastAPI / Typer / pytest).
+- Typed arguments give IDE completion and type-checking.
+- "One file, one migration" is explicit in the code (two `@joryu.migration` decorators in the same file is an ERROR).
+- The Alembic-style module-level attribute approach is dropped.
 
 ---
 
-## 4. Operations API（Django 風だが SQLAlchemy ネイティブ）
+## 4. Operations API
 
-### 4.1 設計方針
+(Django-flavored, but SQLAlchemy-native.)
 
-- **Alembic の `op.*` の最大の不満点**を解消する：
-  - 引数の冗長さ（`sa.Column(...)` を毎回書く）
-  - 方言固有オプションの散在（`postgresql_using=...` などが API のあちこちに）
-  - escape hatch (`op.execute`) が二級市民
-- **Django の Operations クラス**の長所を取り入れる：
-  - 宣言的オブジェクトで履歴をリプレイ可能 → 過去のスキーマ状態を再構築できる
-  - データ移行 (`RunPython`) と DDL (`AddField` 等) が同じ list に並ぶ
-- **SQLAlchemy MetaData / Column と相互運用** — モデルクラスをそのまま渡せる
+### 4.1 Design principles
 
-### 4.2 主要 API
+- Resolve the chief frustrations with Alembic's `op.*`:
+  - Verbose arguments (every column wrapped in `sa.Column(...)`).
+  - Dialect-specific options scattered through the API (`postgresql_using=...` etc.).
+  - The escape hatch (`op.execute`) being a second-class citizen.
+- Adopt the strengths of Django's Operations classes:
+  - Declarative objects let history be replayed, so any past schema state can be reconstructed.
+  - Data migrations (`RunPython`) and DDL (`AddField`, etc.) live in the same list.
+- Interoperate with SQLAlchemy MetaData / Column — accept model classes directly.
+
+### 4.2 Core API
 
 ```python
 from joryu import op, types as t
@@ -160,32 +186,32 @@ op.create_check_constraint(name, table, condition)
 op.create_foreign_key(name, source_table, ref_table, source_cols, ref_cols, **fk_kwargs)
 op.drop_constraint(name, table)
 
-# Escape hatches (一級市民)
-op.execute(sql_or_dict)                         # § 6 参照
-op.run_python(callable)                         # 任意の Python を走らせる
-op.batch(table)                                 # SQLite の table-rebuild を自動化
+# Escape hatches (first-class)
+op.execute(sql_or_dict)                         # see §6
+op.run_python(callable)                         # run arbitrary Python
+op.batch(table)                                 # automate SQLite's table-rebuild
 ```
 
-### 4.3 SQLAlchemy モデルとの統合
+### 4.3 SQLAlchemy model integration
 
 ```python
-from myapp.models import User           # SQLAlchemy モデル
+from myapp.models import User           # SQLAlchemy model
 
 def upgrade():
-    op.create_table_from_model(User)    # __table__ をそのまま使う
+    op.create_table_from_model(User)    # use __table__ directly
     op.add_columns_from_model(User, only=["email", "phone"])
 ```
 
-これにより「モデルに合わせて手でカラム定義を書き直す」二重管理を排除。
+This removes the duplication of "hand-translating model columns into migration code."
 
-### 4.4 batch 操作（SQLite 対応の組込、明示要求）
+### 4.4 Batch operations (SQLite support, opt-in)
 
-SQLite は `ALTER TABLE DROP COLUMN`、制約変更等を直接サポートしないため、内部で table-rebuild（新テーブル作成 → データコピー → rename）が必要。
+SQLite does not directly support `ALTER TABLE DROP COLUMN`, constraint changes, etc.; internally a table-rebuild (create new table → copy data → rename) is required.
 
-**設計判断: 明示要求とする（暗黙の自動 batch 化はしない）**:
-- 数千万行のテーブルで silent な table-rebuild は危険（コピーコスト、ロック挙動、FK 一時 disable が見えない）
-- ensure semantics の原則「勝手に状態を変えない」と一貫
-- ただし `joryu generate` は SQLite ターゲット時に **自動的に `op.batch` でラップしたコードを生成** する（生成は支援、実行は明示）
+**Design rationale — explicit opt-in (no implicit auto-batching)**:
+- A silent table-rebuild on a multi-million-row table is dangerous (copy cost, lock behavior, hidden FK toggling).
+- Consistent with the ensure-semantics principle of "never change state behind the user's back."
+- However `joryu generate` produces code already wrapped in `op.batch` when targeting SQLite (generation assists; execution stays explicit).
 
 ```python
 def upgrade():
@@ -193,21 +219,21 @@ def upgrade():
         batch.alter_column("email", nullable=False)
         batch.drop_column("legacy_field")
         batch.create_check_constraint("email_lower", "email = LOWER(email)")
-    # Postgres/MySQL では普通に ALTER、SQLite では table-rebuild
+    # Postgres / MySQL: plain ALTER. SQLite: table-rebuild.
 ```
 
-`with op.batch(...)` を書かずに SQLite で非対応 op を呼んだ場合は ERROR で止まる（`UnsupportedOperationOnSQLite`、batch 化を提案するメッセージ付き）。
+Calling an unsupported op on SQLite without `with op.batch(...)` raises `UnsupportedOperationOnSQLite`, with a message suggesting batch.
 
-Alembic の `batch_alter_table` と同思想だが、明示性を高めた設計。
+Same idea as Alembic's `batch_alter_table`, but more explicit.
 
-### 4.5 データ移行 (`run_python`)
+### 4.5 Data migration (`run_python`)
 
 ```python
 def upgrade():
     op.add_column("users", "email_normalized", t.Text)
 
     def normalize(conn, dialect, checkpoint):
-        # SQLAlchemy Connection が渡される。アプリのモデルも import 可能
+        # Receives a SQLAlchemy Connection. App models may be imported.
         conn.execute(text("UPDATE users SET email_normalized = LOWER(email)"))
         if dialect.name == "postgresql":
             conn.execute(text("CREATE INDEX ... USING GIN ..."))
@@ -217,78 +243,77 @@ def upgrade():
     op.alter_column("users", "email_normalized", nullable=False)
 ```
 
-- DDL とデータ移行が **同じトランザクション内に並ぶ**（Alembic の最大の強み）
-- 関数は `(connection, dialect, checkpoint)` を受け取る（`checkpoint` の詳細は §9.5 / §9.15）
-- アプリの SQLAlchemy モデルを `import` しても OK（ただし「現時点のモデル」になる点は注意 — 後述）
+- DDL and data migration sit in the same transaction (Alembic's biggest strength).
+- The function receives `(connection, dialect, checkpoint)` (see §13.1 / §13.3 for `checkpoint`).
+- Importing app SQLAlchemy models is fine, but note they reflect the *current* model shape — see §12.
 
 ---
 
-## 5. AI フレンドリーな API 設計
+## 5. AI-friendly API design
 
-Alembic の `op` API が LLM に書きにくい理由：
+Why Alembic's `op` API is hard for LLMs to write correctly:
 
-1. `sa.Column(...)` のネスト構造（行が長くなる）
-2. 方言固有 kwarg が散在（`postgresql_using=`, `mysql_engine=` …）
-3. `op.execute(text("..."))` の二段ラッピング
-4. 引数の順序が直感的でない（`op.add_column(table, sa.Column(name, type))`）
+1. Nested `sa.Column(...)` structure (lines get long).
+2. Dialect-specific kwargs scattered around (`postgresql_using=`, `mysql_engine=`, …).
+3. Two-layer wrapping with `op.execute(text("..."))`.
+4. Counterintuitive argument order (`op.add_column(table, sa.Column(name, type))`).
 
-joryu はこれらを潰す：
+joryu eliminates these:
 
-| 項目 | Alembic | joryu |
+| Item | Alembic | joryu |
 |---|---|---|
-| カラム追加 | `op.add_column("u", sa.Column("e", sa.Text(), nullable=False))` | `op.add_column("u", "e", t.Text, nullable=False)` |
-| 生 SQL 実行 | `op.execute(text("..."))` | `op.execute("...")` |
-| 方言別 SQL | `if op.get_bind().dialect.name == "postgres": op.execute(...)` | `op.execute({"postgresql": "...", "mysql": "..."})` |
-| 型 | `sa.Integer()`, `sa.BigInteger()` | `t.Int`, `t.BigInt` (短い・型ヒント完備) |
+| Add column | `op.add_column("u", sa.Column("e", sa.Text(), nullable=False))` | `op.add_column("u", "e", t.Text, nullable=False)` |
+| Raw SQL | `op.execute(text("..."))` | `op.execute("...")` |
+| Per-dialect SQL | `if op.get_bind().dialect.name == "postgres": op.execute(...)` | `op.execute({"postgresql": "...", "mysql": "..."})` |
+| Types | `sa.Integer()`, `sa.BigInteger()` | `t.Int`, `t.BigInt` (short, fully type-hinted) |
 
-加えて：
+In addition:
 
-- **すべての op API に型ヒント** → LSP が補完を出せる → LLM も schema を把握できる
-- **`joryu generate` の出力を LLM が読みやすい体裁** に統一（決まった import 順、決まった引数順）
-- **`joryu explain <id>`** で migration を自然言語化（人間レビューと LLM レビュー両方を助ける）
+- Every op API has type hints, so LSP completion works and LLMs can read the schema.
+- `joryu generate` output uses a uniform style readable by LLMs (fixed import order, fixed argument order).
+- `joryu explain <id>` renders a migration as natural-language prose (useful for both human and LLM review).
 
 ---
 
-## 6. 複数 DB 方言対応（重要要件）
+## 6. Multi-dialect support
 
-> 「同じマイグレーションファイルが SQLite でも MySQL でも動く」必要がある。
-> ライブラリがネイティブ統一 API を提供する必要はないが、**ユーザが手で書けば可能** な構造にする。
+> "The same migration file must run on SQLite and on MySQL."
+> The library does not need to provide a unified native API for everything, but the structure must let users write portable migrations by hand.
 
-### 6.1 三層モデル
+### 6.1 The three-layer model
 
-joryu は SQL 表現を 3 つのレイヤで扱う：
+joryu deals with SQL across three layers:
 
-1. **Layer 1: Operations 抽象（方言自動）**
-   `op.create_table`, `op.add_column` などは joryu が方言別 SQL に翻訳する。
-   ユーザは方言を意識しない。最も多くのケースをこれでカバー。
+1. **Layer 1: Operations abstractions (dialect-automatic)**
+   `op.create_table`, `op.add_column`, etc. are translated to per-dialect SQL by joryu. The user does not think about dialects. This covers the bulk of cases.
 
-2. **Layer 2: 方言別ディスパッチ（`op.execute(dict)` / `op.run_python`）**
-   `op.execute` は文字列・dict のどちらも受ける：
+2. **Layer 2: Per-dialect dispatch (`op.execute(dict)` / `op.run_python`)**
+   `op.execute` accepts either a string or a dict:
    ```python
-   # 単一 SQL — 全方言で同じものを実行
+   # Single SQL — same statement on every dialect
    op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
 
-   # 方言別 SQL
+   # Per-dialect SQL
    op.execute({
        "postgresql": "CREATE INDEX CONCURRENTLY ... USING GIN (data)",
        "mysql":      "CREATE INDEX ... ON ...((CAST(data AS CHAR(255))))",
        "sqlite":     "CREATE INDEX ... ON ...(data)",
    })
 
-   # default fallback
+   # Default fallback
    op.execute({
        "postgresql": "CREATE INDEX CONCURRENTLY ...",
-       "default":    "CREATE INDEX ...",      # postgresql 以外はこれ
+       "default":    "CREATE INDEX ...",      # used by every dialect other than postgresql
    })
    ```
-   key の正規化:
-   - `"postgresql"`, `"postgres"`, `"pg"` は同義（最も標準的な `"postgresql"` を推奨）
-   - `"mysql"`, `"mariadb"` は別 key（実装が分岐するケースがあるため）。両方に同じ SQL を書きたい時は `default` 使用
-   - `"sqlite"`
-   - `"default"` は他のどの key にもマッチしない方言で使われる
-   - 現方言にも `"default"` にもマッチしなければ ERROR
+   Key normalization:
+   - `"postgresql"`, `"postgres"`, `"pg"` are synonyms (prefer the standard `"postgresql"`).
+   - `"mysql"` and `"mariadb"` are separate keys (implementations sometimes diverge). Use `default` when sharing the same SQL between them.
+   - `"sqlite"`.
+   - `"default"` is used when the current dialect matches no other key.
+   - If neither the current dialect nor `"default"` matches, raise ERROR.
 
-   または関数で：
+   Or with a function:
    ```python
    def upgrade():
        d = op.dialect.name
@@ -298,14 +323,14 @@ joryu は SQL 表現を 3 つのレイヤで扱う：
            op.create_table("status_enum", op.column("value", t.Text, primary_key=True))
    ```
 
-3. **Layer 3: ファイル単位の方言限定 + Group**
-   どうしても 1 ファイルで両立しない場合、`dialects=` で限定し、`group=` で論理的に束ねる：
+3. **Layer 3: Per-file dialect restriction + group**
+   When a single file genuinely cannot cover both, restrict it with `dialects=` and bind it to siblings with `group=`:
    ```python
    # 20260601T120000_pg_partitions.py
    @joryu.migration(
        id="20260601T120000_pg_partitions",
        dialects=["postgresql"],
-       group="20260601_partitions",          # 論理 group ID
+       group="20260601_partitions",          # logical group ID
        depends_on=["20260530T100000_create_events"],
    )
    def upgrade(): ...
@@ -314,30 +339,30 @@ joryu は SQL 表現を 3 つのレイヤで扱う：
    @joryu.migration(
        id="20260601T120000_mysql_partitions",
        dialects=["mysql"],
-       group="20260601_partitions",          # 同じ group
+       group="20260601_partitions",          # same group
        depends_on=["20260530T100000_create_events"],
    )
    def upgrade(): ...
    ```
-   各環境では自分の方言に合致するもののみ適用される。`group=` の効果:
-   - `joryu status` で「同じ論理変更」として束ねて表示
-   - 後続 migration が `depends_on=["group:20260601_partitions"]` と書ける（その方言で適用された ID を自動解決）
-   - `joryu verify` で「group 内のどれか 1 つは方言ごとに用意されているか」をチェック
+   Each environment only applies the file matching its dialect. `group=` has these effects:
+   - `joryu status` displays them as one logical change.
+   - Later migrations can write `depends_on=["group:20260601_partitions"]`; joryu resolves it to the ID actually applied for the current dialect.
+   - `joryu verify` checks that the group has at least one file per dialect.
 
-### 6.2 推奨ユースケース別の選び方
+### 6.2 Recommended layer per use case
 
-| ケース | 推奨 Layer |
+| Case | Recommended layer |
 |---|---|
-| カラム追加、テーブル作成、index 作成（型違いは joryu 側で吸収可） | L1 |
-| `JSON` vs `JSONB`、`SERIAL` vs `AUTO_INCREMENT` 等の細部 | L1（joryu が方言別にレンダリング） |
-| `CREATE INDEX CONCURRENTLY`、partial index、generated column | L2 (`op.execute(dict)`) |
-| データ移行で方言固有関数 (`jsonb_set` vs `JSON_SET`) | L2 (`op.run_python` 内分岐) |
-| Postgres にしかない機能 (`CREATE EXTENSION`, RLS, materialized view) | L3（dialect 限定ファイル） |
-| SQLite だけ `batch` table-rebuild 必須 | L1 + `op.batch`（自動切替） |
+| Add column, create table, create index (type differences absorbed by joryu) | L1 |
+| `JSON` vs `JSONB`, `SERIAL` vs `AUTO_INCREMENT`, etc. | L1 (joryu renders per dialect) |
+| `CREATE INDEX CONCURRENTLY`, partial index, generated column | L2 (`op.execute(dict)`) |
+| Data migration using dialect-specific functions (`jsonb_set` vs `JSON_SET`) | L2 (branching inside `op.run_python`) |
+| Features exclusive to Postgres (`CREATE EXTENSION`, RLS, materialized view) | L3 (dialect-restricted file) |
+| SQLite-only `batch` table-rebuild | L1 + `op.batch` (auto-routing) |
 
-### 6.3 型の互換性
+### 6.3 Type compatibility
 
-joryu の `types` モジュールは方言間の最小公倍数を意識：
+The `joryu.types` module targets the cross-dialect lowest common denominator:
 
 | `joryu.types` | Postgres | MySQL | SQLite |
 |---|---|---|---|
@@ -350,37 +375,37 @@ joryu の `types` モジュールは方言間の最小公倍数を意識：
 | `Decimal(p,s)` | NUMERIC | DECIMAL | NUMERIC |
 | `Bool`       | BOOLEAN | TINYINT(1) | INTEGER |
 
-**方言固有型**を使いたい場合は `types.dialect("postgresql.tsvector")` のようなエスケープがある。
+For dialect-specific types use the escape `types.dialect("postgresql.tsvector")`.
 
-### 6.4 テスト戦略（unit / integration の二層）
+### 6.4 Test strategy (two-tier: unit / integration)
 
-migration の動作検証は **二層構成**:
+Migration behavior is verified at two tiers:
 
-#### Unit testing（デフォルト、軽量）
+#### Unit testing (default, lightweight)
 
 ```
 joryu test                                 # = joryu test --unit
 joryu test --unit
 ```
 
-- **in-memory SQLite** で全 migration を適用 → re-apply（ensure semantics 確認）
-- 補助として in-memory な仮想 DB（純 Python の DDL シミュレータ）でも実行し、Operations の正当性を確認
-- 数秒で終わる。**通常開発・PR の CI で常時実行**
-- 検証: 構文エラー、ensure semantics 整合、`joryu verify` 同等のチェック、checkpoint API 正常動作
+- Apply every migration against an in-memory SQLite and then re-apply (verifying ensure semantics).
+- Also run against an in-memory virtual DB (pure-Python DDL simulator) to validate Operations correctness.
+- Completes in seconds. Run continuously during development and on every PR.
+- Verifies syntax errors, ensure-semantics consistency, the same checks as `joryu verify`, and correct behavior of the checkpoint API.
 
-#### Integration testing（任意、重い）
+#### Integration testing (optional, heavy)
 
 ```
-joryu test --integration                                   # 設定された全 dialect
-joryu test --integration --dialects=postgresql,mysql        # 個別指定
+joryu test --integration                                   # all configured dialects
+joryu test --integration --dialects=postgresql,mysql        # explicit subset
 ```
 
-- **testcontainers** で各 RDBMS の本物のインスタンスを起動して全 migration を適用
-- 方言固有の挙動（MySQL の暗黙 commit、Postgres の DDL transactional 性、SQLite の table-rebuild）を実機で検証
-- 数分〜数十分。**nightly CI / リリース前の検証で実行**
-- testcontainers が無い環境ではスキップ（CI runner で Docker が使えること前提）
+- Use testcontainers to spin up real RDBMS instances and apply all migrations against them.
+- Verifies dialect-specific behavior on real engines (MySQL's implicit DDL commits, PostgreSQL's transactional DDL, SQLite's table-rebuild).
+- Takes minutes to tens of minutes. Run in nightly CI and before release.
+- Skipped when testcontainers is unavailable (CI runners must have Docker).
 
-#### 設定
+#### Configuration
 
 ```toml
 [joryu.test]
@@ -390,133 +415,133 @@ postgresql_image = "postgres:16"
 mysql_image = "mysql:8"
 ```
 
-#### 検証内容
+#### Verification scope
 
-両モードに共通:
-- 全 migration の順次 apply が成功
-- Re-apply で ensure semantics により全て skip される（冪等性確認）
-- `joryu verify` で意味的競合・改変検知が clean
-- 方言ごとに最終 schema が論理的に等価（テーブル/カラム/nullable/PK 一致）
+Common to both modes:
+- All migrations apply successfully in order.
+- Re-applying skips everything via ensure semantics (idempotency).
+- `joryu verify` reports no semantic conflicts or drift.
+- The final schema is logically equivalent across dialects (matching tables / columns / nullability / PKs).
 
-### 6.5 制約事項（明文化）
+### 6.5 Constraints (explicit)
 
-「同一ファイルで複数方言を動かす」ことを支援はするが、**ユーザの責任で互換性を保つ**領域は明示する：
+Cross-dialect operation within a single file is supported but compatibility remains the user's responsibility in these areas:
 
-- 方言固有のデータ型を直接書いた場合（L2/L3）
-- DDL の挙動差（MySQL の暗黙 commit、SQLite の制約変更不可、Postgres の DDL transactional 等）
-- データ移行関数内の SQL 文字列
+- Dialect-specific types written directly (L2/L3).
+- DDL behavior differences (MySQL's implicit commit, SQLite's constraint-change limits, Postgres's transactional DDL).
+- Raw SQL strings inside data migration functions.
 
 ---
 
-## 7. 並走 PR と整合性検知
+## 7. Parallel PRs and consistency detection
 
-> **設計原則**: 並走 PR は **デフォルトで衝突しない**。同じスキーマ要素に触れた場合のみ検出する。
-> Atlas の `atlas.sum` のように「全 PR を強制的に conflict させる」モデルは採用しない（並走 OK の要件に反する）。
+> **Design principle**: parallel PRs do not conflict by default. Conflicts arise only when they touch the same schema element.
+> The Atlas `atlas.sum` model — which forces every PR to conflict — is rejected (it contradicts the parallel-safe requirement).
 
-3 つの独立した仕組みで安全性を担保する：
+Three independent mechanisms ensure safety:
 
-### 7.1 改変検知 — `joryu_migrations.checksum`（DB 側）
+### 7.1 Mutation detection — `joryu_migrations.checksum` (DB side)
 
-- §9.1 の `joryu_migrations.checksum` に適用時のファイルハッシュを保存
-- `joryu apply` / `joryu verify` 時、**適用済み** ファイルのディスク上ハッシュが DB の値と異なれば **エラー**
-- 「過去マイグレーションの後付け改変」を本番／CI で検知できる
-- 未適用ファイルにはノーチェック（ローカルで書き直し放題）
-- ディスク上の集中ファイルは不要 → PR で衝突しない
+- The `joryu_migrations.checksum` column (§9.2) stores the file hash recorded at apply time.
+- During `joryu apply` / `joryu verify`, if the on-disk hash of an *already-applied* file differs from the DB value, raise ERROR.
+- Detects "I just retroactively edited an old migration" mistakes in production / CI.
+- Unapplied files are not checked (rewrite freely while developing locally).
+- No central file on disk, so PRs never conflict over it.
 
-**他ライブラリでの採用状況**:
-- 採用: Flyway, Liquibase, Prisma Migrate, Atlas（enterprise / schema-as-code 系）
-- 非採用: Alembic, Django migrations, yoyo, goose, golang-migrate, Diesel, sqlx（スクリプト寄り古典系）
+**Adoption elsewhere**:
+- Adopted: Flyway, Liquibase, Prisma Migrate, Atlas (enterprise / schema-as-code).
+- Not adopted: Alembic, Django migrations, yoyo, goose, golang-migrate, Diesel, sqlx (the classic script-oriented camp).
 
-**実用上の価値**: 開発者が「typo 直すだけ」と過去のマイグレーションを編集する事故、rebase での意図しない変更、「適用後にちょっと修正して再適用」を CI で検知できる。Alembic でこの種の事故が起きると本番 DB と migration history が乖離して新環境構築時に違うスキーマになる、というデバッグ困難な障害になる。コストはほぼゼロ（ハッシュ計算と列 1 つ）。
+**Practical value**: it catches the "I just fixed a typo" accident on an old migration, unintended edits during rebase, and "apply, tweak, re-apply" flows in CI. With Alembic, this class of bug silently desynchronizes the production DB from migration history and shows up later as a fresh-environment build with a different schema. Cost is negligible (one hash, one column).
 
-**正当な編集が必要なとき**: `joryu repair <id>` で checksum を更新（こっそり編集を強制しない明示的な手段）。
+**Legitimate edits**: `joryu repair <id>` updates the checksum (an explicit channel, not a silent override).
 
-### 7.2 意味的競合検知 — `joryu verify`（CI 側）
+### 7.2 Semantic conflict detection — `joryu verify` (CI side)
 
-各 Operation は静的に「触れる対象」を `(table, column)` ペア単位で列挙できる。
-`joryu verify` は **未適用マイグレーション全体** をスキャンし、**非可換な op の組** だけを ERROR として検出する。warning カテゴリは設けない（無視される運命なので）。
+Each Operation can statically enumerate its touched targets as `(table, column)` pairs.
+`joryu verify` scans all unapplied migrations and flags only non-commutative op pairs as ERROR. There is no warning category (warnings get ignored).
 
-| 並走する 2 つの Op | 可換性 | 判定 |
+| Two parallel ops | Commutative | Decision |
 |---|---|---|
-| `add_column(users, A)` + `add_column(users, B)` (A≠B) | 可換 | **無音** |
-| `add_column(users, A)` + `alter_column(users, B)` (A≠B) | 可換 | **無音** |
-| `add_column(t1, ...)` + 任意の `t2` への変更 (t1≠t2) | 可換 | **無音** |
-| `alter_column(users, email)` + `alter_column(users, email)` | × | **ERROR** |
-| `add_column(users, X)` + `drop_column(users, X)` | × | **ERROR** |
-| 何らかの `users` への変更 + `drop_table(users)` | × | **ERROR** |
-| 何らかの `users.X` への変更 + `rename_column(users, X, Y)` | × | **ERROR** |
-| 何らかの `users` への変更 + `rename_table(users, accounts)` | × | **ERROR** |
-| 一方が `op.execute(raw)` / `op.run_python(...)` | 静的解析不能 | **無音**（人間レビュー責任） |
+| `add_column(users, A)` + `add_column(users, B)` (A≠B) | yes | **silent** |
+| `add_column(users, A)` + `alter_column(users, B)` (A≠B) | yes | **silent** |
+| `add_column(t1, ...)` + any change to `t2` (t1≠t2) | yes | **silent** |
+| `alter_column(users, email)` + `alter_column(users, email)` | no | **ERROR** |
+| `add_column(users, X)` + `drop_column(users, X)` | no | **ERROR** |
+| Any change to `users` + `drop_table(users)` | no | **ERROR** |
+| Any change to `users.X` + `rename_column(users, X, Y)` | no | **ERROR** |
+| Any change to `users` + `rename_table(users, accounts)` | no | **ERROR** |
+| One side is `op.execute(raw)` / `op.run_python(...)` | not analyzable | **silent** (human review responsibility) |
 
-**設計判断**: 「通常運用でノイズにならない」ことを最優先。同じテーブルに別カラムを順次追加する普通の運用では何も発火しない。本当に危ない時だけ止まる。
+**Design rationale**: "no noise on normal workflows" is the top priority. Adding distinct columns to the same table — the common case — never trips this. Only genuinely dangerous combinations stop the build.
 
-### 7.3 順序の保証 — `depends_on`
+### 7.3 Ordering guarantee — `depends_on`
 
-- 順序を強制したいなら `migration.depends_on = ["先行 id", ...]` を書く
-- 書かなければ「順序は問わない（タイブレークは timestamp 昇順）」という宣言
-- 既存マイグレーションの **改変は禁止**（§7.1 の checksum で検出）。新規追加のみ
-- 適用時は depends_on の DAG をトポロジカルソート
+- If you need ordering, set `migration.depends_on = ["predecessor id", ...]`.
+- Omitting it declares "I don't care about ordering (tiebreaker: timestamp ascending)."
+- Editing applied migrations is forbidden (caught by checksum in §7.1). Only append.
+- During apply, the `depends_on` DAG is topologically sorted.
 
-### 7.4 並走 PR のシナリオ別
+### 7.4 Scenarios for parallel PRs
 
-| ケース | 結果 |
+| Case | Outcome |
 |---|---|
-| 完全に独立な変更（A は users 追加、B は orders 追加） | 衝突なし、両方 merge して順次適用 |
-| 同テーブルに別カラム追加 | **無音**、両方 merge して順次適用 |
-| 同カラムを両方が変更 | `joryu verify` ERROR。片方を rebase して `depends_on` を付ける |
-| 順序が重要（B が A 前提） | B の `depends_on` に A を書く |
-| A が先に merge & 適用済み、その後 B を merge | B は未適用のまま残り、次回 `joryu apply` で実行 |
-| 適用済みファイルを誰かが改変 | `joryu apply` / `verify` で checksum 不一致 → ERROR、必要なら `joryu repair` |
+| Fully independent changes (A adds users, B adds orders) | No conflict; merge both, apply in order. |
+| Different columns added to the same table | **Silent**; merge both, apply in order. |
+| Both modify the same column | `joryu verify` ERROR. Rebase one and add `depends_on`. |
+| Ordering matters (B depends on A) | Put A in B's `depends_on`. |
+| A is merged and applied, then B is merged | B stays unapplied and runs on the next `joryu apply`. |
+| Someone edits an applied file | `joryu apply` / `verify` reports a checksum mismatch — ERROR. Use `joryu repair` if intentional. |
 
 ---
 
-## 8. 自動生成（SQLAlchemy 差分）
+## 8. Autogeneration (SQLAlchemy diff)
 
-### 8.1 コマンド
+### 8.1 Command
 
 ```
 joryu generate "add users table"
-joryu generate "..." --empty             # 空テンプレを作る
-joryu generate "..." --against=db        # 現在の DB と比較
-joryu generate "..." --against=replay    # 既存マイグレーションを再生して比較（CI 向け）
+joryu generate "..." --empty             # create an empty template
+joryu generate "..." --against=db        # compare against the current DB
+joryu generate "..." --against=replay    # replay existing migrations and compare (CI-friendly)
 ```
 
-1. `joryu.toml` の `target` (例: `myapp.models:Base.metadata`) をロード
-2. 比較対象スキーマと差分検出
-3. **Operations のリストとして** Python ファイル生成
+1. Load the `target` from `joryu.toml` (e.g., `myapp.models:Base.metadata`).
+2. Detect diffs against the comparison schema.
+3. Produce a Python file as a list of Operations.
 
-### 8.2 比較対象
+### 8.2 Comparison sources
 
-| モード | 比較対象 | 用途 |
+| Mode | Compared against | Use case |
 |---|---|---|
-| `--against=db` (default) | 実 DB の現在スキーマ | dev DB あり |
-| `--against=replay` | 既存マイグレーションをメモリ上で再生して得た仮想スキーマ | CI、DB なし生成 |
+| `--against=db` (default) | The current schema of the real DB | Developer with a dev DB |
+| `--against=replay` | A virtual schema obtained by replaying existing migrations in memory | CI, generation without a DB |
 
-Alembic の `--autogenerate` は DB 必須で CI 不向き。joryu は両対応する。
+Alembic's `--autogenerate` requires a DB, which makes CI use awkward. joryu supports both.
 
-### 8.3 生成結果
+### 8.3 Generated output
 
-- 危険操作 (`drop_table`, `drop_column`, NOT NULL 追加) には `# WARNING: ...` コメント挿入
-- 不可逆操作は別ファイルに分割提案
-- データ移行が必要なケース（NOT NULL 追加で既存行を埋める等）は **空の `op.run_python` プレースホルダ** を入れて人間に書かせる
+- Dangerous operations (`drop_table`, `drop_column`, adding NOT NULL) carry a `# WARNING: ...` comment.
+- Irreversible operations are suggested to be split into a separate file.
+- Cases that require data migration (NOT NULL with backfill, etc.) include an empty `op.run_python` placeholder so a human fills it in.
 
 ---
 
-## 9. 実行モデル（中断・再開・大量データを正面から扱う）
+## 9. Execution model: transactions, idempotency, locking
 
-> Alembic / Django 等の従来型は「migration は最後まで実行されるか、丸ごと rollback されるか」の二択しか持たない。
-> 数千万行の `UPDATE` でこのモデルは破綻する（rollback が本体より重い、long-running transaction が他クエリを止める、MySQL は DDL を暗黙 commit してそもそも transactional 保証が崩れる）。
-> joryu は **「途中で止まる」を一級市民として扱い、Operations を idempotent / resumable に設計** する。
+> Alembic / Django and similar systems have only two states: "migration runs to completion" or "migration is rolled back wholesale."
+> That model breaks down on multi-ten-million-row `UPDATE`s — rollback costs more than the work, long-running transactions block other queries, and MySQL implicitly commits DDL so the transactional guarantee is a lie anyway.
+> joryu treats "interruption" as a first-class concept and designs Operations to be idempotent and resumable.
 
-### 9.1 設計の柱
+### 9.1 Design pillars
 
-1. **Ensure-style Operations**: `op.add_column` 等は「その状態であることを保証」する意味論。既にその名前・型で存在すれば no-op、不整合なら ERROR。再実行可能
-2. **Per-step state tracking**: 「どの migration が完了したか」だけでなく「migration 内のどの step まで完了したか」を DB に記録
-3. **3 つの transaction mode**: `per_migration` / `per_step` (default) / `none` から選択
-4. **Batched data migrations**: 大量行更新は `op.batched_update` で batch + checkpoint
-5. **Resume**: 中断したマイグレーションは `joryu apply` 再実行で続きから
+1. **Ensure-style Operations**: `op.add_column` etc. assert "this state must exist." If the column already exists with the desired name and type, no-op. If it exists with conflicting attributes, ERROR. Re-runnable.
+2. **Per-step state tracking**: record not only which migration completed, but which *step* within a migration completed.
+3. **Three transaction modes**: choose from `per_migration` / `per_step` (default) / `none`.
+4. **Batched data migrations**: large updates use `op.run_python` with checkpoints (§13.1).
+5. **Resume**: re-running `joryu apply` continues an interrupted migration from where it stopped.
 
-### 9.2 状態テーブル
+### 9.2 State tables
 
 ```sql
 CREATE TABLE joryu_migrations (
@@ -532,312 +557,253 @@ CREATE TABLE joryu_migrations (
 CREATE TABLE joryu_migration_steps (
     migration_id    VARCHAR(120) NOT NULL,
     step_index      INTEGER      NOT NULL,
-    op_fingerprint  VARCHAR(80)  NOT NULL,     -- op の種類と引数のハッシュ
+    op_fingerprint  VARCHAR(80)  NOT NULL,     -- hash of op kind and arguments
     status          VARCHAR(20)  NOT NULL,     -- 'running' | 'done' | 'failed'
     started_at      TIMESTAMP    NOT NULL,
     finished_at     TIMESTAMP    NULL,
-    progress        TEXT         NULL,         -- batched_update のチェックポイント等
+    progress        TEXT         NULL,         -- checkpoint state, etc.
     PRIMARY KEY (migration_id, step_index)
 );
 ```
 
-- `status='applied'` の migration は二度と実行しない（Alembic と同じ）
-- `status='running'` / `'failed'` は再開対象。`joryu_migration_steps` を見て done でない step から再開
-- `op_fingerprint` は再開時にコード変更を検知（同じ index に違う op があれば ERROR）
+- A migration with `status='applied'` is never re-executed (same as Alembic).
+- `status='running'` or `'failed'` is a resume target. Replay from the first non-`done` step using `joryu_migration_steps`.
+- `op_fingerprint` detects code edits at resume time (a different op at the same index is ERROR).
 
-### 9.3 Transaction Mode（三択）
+### 9.3 Transaction mode (three choices)
 
-`migration.transaction_mode` に応じて挙動が変わる：
+Behavior depends on `migration.transaction_mode`:
 
-| Mode | 挙動 | 適する場面 |
+| Mode | Behavior | Best for |
 |---|---|---|
-| `"per_migration"` | migration 全体を 1 トランザクションで包む | 小規模 DDL のみ。Postgres/SQLite で DDL を atomic にしたい時 |
-| `"per_step"` (**default**) | 各 op を個別トランザクションで実行・commit | 大半の運用。途中で止まっても完了済み step は残る |
-| `"none"` | トランザクション無し（暗黙 commit に任せる） | `CREATE INDEX CONCURRENTLY`、`VACUUM`、MySQL の重い DDL |
+| `"per_migration"` | Wrap the whole migration in one transaction | Small DDL only. When you want atomic DDL on Postgres / SQLite. |
+| `"per_step"` (**default**) | Each op runs and commits in its own transaction | The majority of workloads. Completed steps survive interruption. |
+| `"none"` | No transaction (rely on implicit commit) | `CREATE INDEX CONCURRENTLY`, `VACUUM`, heavy MySQL DDL. |
 
-**なぜ `per_step` がデフォルトか**:
-- MySQL は DDL が暗黙 commit するので `per_migration` は嘘になる。揃えて `per_step` の方が一貫性がある
-- 数千万行への UPDATE を 1 トランザクションで包むのは現実的でない（rollback がコストになる、lock 保持時間が長い、binlog が肥大）
-- step 単位 commit なら、N step 中 K step まで完了した状態が DB に残り、続きから再開できる
-- 「冪等な op」と組み合わせると、再実行で完了済み step は skip され、止まった step から再開される
+**Why `per_step` is the default**:
+- MySQL implicitly commits DDL, so `per_migration` is a lie. Standardizing on `per_step` is more honest.
+- Wrapping a multi-ten-million-row UPDATE in a single transaction is impractical (rollback cost, lock duration, binlog growth).
+- Step-granular commits leave "K of N steps complete" durable in the DB, so resumption works.
+- Combined with idempotent ops, re-running skips completed steps and continues from the failed one.
 
-#### 9.3.1 方言別の transaction 実態
+#### 9.3.1 Real transactional behavior per dialect
 
-DDL のトランザクション挙動は方言で大きく異なる。joryu は実態を隠さず明示する：
+DDL transactional behavior diverges wildly by dialect. joryu does not hide this:
 
-| 方言 | DDL の atomic 性 | データ DML | `per_migration` の現実 | `per_step` の現実 |
+| Dialect | DDL atomicity | Data DML | Reality of `per_migration` | Reality of `per_step` |
 |---|---|---|---|---|
-| **PostgreSQL** | 完全に transactional（ほぼ全 DDL が rollback 可） | 通常通り | 期待通りに動く（CONCURRENTLY 系を除く） | 期待通り |
-| **MySQL 8.0+ (InnoDB)** | 各 DDL は **暗黙 commit** (atomic DDL は per-statement のみ) | 通常通り | **嘘**: 最初の DDL で commit され、それ以降は rollback 不能 | DDL は実質 `none` 相当、データ DML は tx 内 |
-| **MariaDB** | 同上（暗黙 commit） | 通常通り | 嘘 | MySQL と同じ |
-| **SQLite** | transactional | 通常通り | 期待通り | 期待通り |
+| **PostgreSQL** | Fully transactional (almost all DDL is rollback-safe) | Normal | Works as advertised (except CONCURRENTLY family) | Works as advertised |
+| **MySQL 8.0+ (InnoDB)** | Each DDL implicitly commits (atomic DDL is per-statement only) | Normal | **A lie**: the first DDL commits and nothing after can roll back | DDL is effectively `none`; data DML stays in-tx |
+| **MariaDB** | Same (implicit commit) | Normal | A lie | Same as MySQL |
+| **SQLite** | Transactional | Normal | Works as advertised | Works as advertised |
 
-**実用上の指針**:
-- **MySQL 環境では `per_migration` を選ぶ意味がほぼない**。明示的に選ぶと joryu は warning を出す
-- MySQL で「複数 DDL を atomic に」したいケースは諦めるしかない（DB 側の制約）。代わりに **migration を細かく分ける** (1 migration = 1 DDL を志向) ことを推奨
-- 大量データ UPDATE (`batched_update`) は方言問わず正常に動作する（DML の transaction は MySQL でも普通に効く）
-- `per_step` がデフォルトなのは、MySQL でも Postgres でも「最低限 step 単位の進捗が残る」最小公倍数だから
+**Practical guidance**:
+- On MySQL, `per_migration` rarely makes sense. Choosing it explicitly emits a warning.
+- "Atomic across multiple DDLs" on MySQL is not achievable (a DB-level constraint). Split migrations finely instead (aim for "1 migration = 1 DDL").
+- Bulk data UPDATE (`op.run_python` with checkpoints) works on every dialect (DML transactions are fine on MySQL).
+- `per_step` is the default because, even on MySQL, it provides the minimum guarantee "step-level progress is durable."
 
-これにより「動いてると思ってたら MySQL でだけ rollback されてなかった」事故を防ぐ。
+This prevents the "I thought it worked, but on MySQL nothing rolled back" class of incident.
 
-### 9.4 Ensure-Style Operations（冪等性の中核）
+### 9.4 Ensure-style Operations (the heart of idempotency)
 
-各 op は **意図された状態 (desired state)** を宣言し、実行前に現状を確認する：
+Each op declares a *desired state* and checks the current state before acting:
 
-| Operation | 既に desired 状態 | 部分一致 (例: 名前あり、型違い) | 未存在 |
+| Operation | Already in desired state | Partial match (e.g., same name, different type) | Missing |
 |---|---|---|---|
-| `add_column(t, c, type)` | **skip** | ERROR（型不一致を勝手に変えない） | 作成 |
-| `drop_column(t, c)` | （存在しないなら）**skip** | — | skip |
-| `alter_column(t, c, ...)` | **skip** | ALTER 実行 | ERROR |
-| `create_table(t, ...)` | **skip** | ERROR（カラム集合が違う） | 作成 |
-| `drop_table(t)` | （存在しないなら）**skip** | — | skip |
-| `create_index(name, ...)` | **skip** | ERROR（定義違い） | 作成 |
-| `rename_column(t, old, new)` | new あり old なし → **skip** | 両方ありは ERROR | old → new |
+| `add_column(t, c, type)` | **skip** | ERROR (does not silently change type) | create |
+| `drop_column(t, c)` | (does not exist) **skip** | — | skip |
+| `alter_column(t, c, ...)` | **skip** | execute ALTER | ERROR |
+| `create_table(t, ...)` | **skip** | ERROR (column set differs) | create |
+| `drop_table(t)` | (does not exist) **skip** | — | skip |
+| `create_index(name, ...)` | **skip** | ERROR (definition differs) | create |
+| `rename_column(t, old, new)` | new exists, old does not → **skip** | both exist → ERROR | rename old → new |
 
-これにより：
-- 中断後の再実行で **既に成功した op は単に skip される**
-- 手動で部分的に修正した DB に対しても、ensure 意味論で揃えにいく
-- Alembic の「カラム既に存在エラーで死ぬ」問題が消える
+This means:
+- Re-running after interruption skips successfully completed ops.
+- A DB that's been partially fixed by hand can be reconciled by ensure semantics.
+- The Alembic "dies because the column already exists" failure mode disappears.
 
-**設計判断**: Alembic は「カラムを追加する」という命令を出す。joryu は「カラムが存在することを保証する」という意図を出す。差は小さく見えるが、運用ではこの差が再開可能性を生む。
+**Design rationale**: Alembic issues the command "add a column." joryu states the intent "this column must exist." The difference looks small but produces resumability in practice.
 
-「**勝手に状態を変えない**」も重要: 型違いを発見したら ERROR にする。silent な mutation は事故の元。型を変えたいなら明示的に `alter_column` を書く。
+"Never silently change state" is equally important: when a type mismatch is found, ERROR. Silent mutation causes incidents. To change a type, write an explicit `alter_column`.
 
-#### 9.4.1 型違い (mismatch) の典型パターン
+### 9.5 Type mismatches and `on_mismatch`
 
-実際に「現状と desired がズレる」のは以下のシナリオ。joryu はこれらを区別する：
+#### 9.5.1 Typical mismatch sources
 
-| 発生源 | 例 | joryu の扱い |
+Real-world sources of "current state differs from desired":
+
+| Source | Example | joryu behavior |
 |---|---|---|
-| 手動 DDL drift | 誰かが psql で `phone VARCHAR(20)` を直接追加、migration は `t.Text` を期待 | **ERROR** |
-| 環境間 drift | dev だけ hotfix で型を変更、migration を全環境で流すと prod だけ ERROR | **ERROR** |
-| 並走 PR の型差 | PR1=`Text`, PR2=`Varchar(20)` で同名カラム追加 | 後者で **ERROR**（CI の `joryu verify` で先に検知できればなお良い） |
-| 方言レンダリング差 | `t.Text` が SQLite では TEXT、MySQL では LONGTEXT | **誤検知しない**（type 抽象層で同一視） |
-| migration 自体の編集 | 適用後に `Text → Varchar(255)` に書き換え | checksum 違反で **先に止まる** (§7.1)、ensure 到達せず |
+| Manual DDL drift | Someone added `phone VARCHAR(20)` via psql; migration expects `t.Text` | **ERROR** |
+| Cross-environment drift | A hotfix only changed dev's column type; running the migration everywhere ERRORs in prod | **ERROR** |
+| Parallel-PR type clash | PR1 = `Text`, PR2 = `Varchar(20)` adds the same column | Second one **ERRORs** (ideally `joryu verify` catches it earlier in CI) |
+| Dialect rendering | `t.Text` is TEXT on SQLite, LONGTEXT on MySQL | **No false positive** (the type abstraction layer treats them as equal) |
+| Edit of the migration itself | After apply, `Text → Varchar(255)` is rewritten | **Stopped earlier** by checksum (§7.1); ensure is never reached |
 
-#### 9.4.2 型違い時の挙動オプション
+#### 9.5.2 `on_mismatch` options
 
-デフォルトは厳格 (silent mutation 一切無し) だが、必要に応じて局所的に緩められる：
+Default is strict (no silent mutation) but can be relaxed locally:
 
 ```python
 op.add_column("users", "phone", t.Text)                         # default: on_mismatch="error"
-op.add_column("users", "phone", t.Text, on_mismatch="alter")    # 明示的に揃えに行く
-op.add_column("users", "phone", t.Text, on_mismatch="skip")     # 違っても放置 (drift 受容)
+op.add_column("users", "phone", t.Text, on_mismatch="alter")    # explicitly reconcile
+op.add_column("users", "phone", t.Text, on_mismatch="skip")     # tolerate drift
 ```
 
-- `"error"` (default): 不一致で止まる。安全側
-- `"alter"`: 暗黙で `ALTER COLUMN` を実行して揃える。VARCHAR 縮小等の破壊的変更も実行されうるので **明示宣言した時のみ**
-- `"skip"`: ログに warn を出すだけで進む。drift を許容する運用向け
+- `"error"` (default): stop on mismatch. Safe.
+- `"alter"`: silently run `ALTER COLUMN` to reconcile. Destructive changes like VARCHAR shrinking can occur, so this is opt-in only.
+- `"skip"`: log a warning and proceed. For drift-tolerant operations.
 
-migration 単位で一括設定したい場合は `migration.on_mismatch = "alter"` も可（非推奨だが可能）。
+A migration-wide default via `migration.on_mismatch = "alter"` is supported (discouraged, but allowed).
 
-### 9.5 Resumable Data Migrations
+### 9.6 Apply algorithm (`joryu apply`)
 
-> **設計判断**: joryu は `batched_update` のような汎用 batching API を **提供しない**。
-> 理由:
-> - WHERE 句と index の整合はライブラリが静的検証できない。「使えば安全」という誤解を生む
-> - batching 戦略は data shape と index 構造に依存（cursor / range / ctid / SKIP LOCKED）。汎用 API は必ず leaky になる
-> - batching loop 自体は小さい。ライブラリの真の価値は **checkpoint 永続化と resume** だけ
->
-> 代わりに、**checkpoint インフラだけを提供** し、batching loop はユーザが書く。
+1. Acquire the advisory lock (§9.7).
+2. Treat `status='running'` / `'failed'` rows in `joryu_migrations` as resume targets.
+3. Build the set of unapplied migrations: everything not `applied` and not excluded by dialect.
+4. Build the `depends_on` DAG and topologically sort (ties: timestamp ascending).
+5. Process resume + unapplied items in order:
+   - If no `joryu_migrations` row exists, INSERT one (`status='running'`) and verify the checksum.
+   - Open a transaction according to `transaction_mode`.
+   - Execute steps in order:
+     - Consult `joryu_migration_steps`; skip if `done`.
+     - For a `running` batched op, resume from `progress`.
+     - Otherwise INSERT step (`status='running'`) → execute op → UPDATE step (`status='done'`).
+     - On failure: UPDATE step (`status='failed'`), mark migration `failed`, stop.
+   - When all steps finish: UPDATE migrations (`status='applied'`, `finished_at=...`).
+6. Release the lock.
 
-#### 9.5.1 `op.run_python` の checkpoint API
+### 9.7 Advisory lock
 
-`op.run_python(fn)` の `fn` は `(connection, dialect, checkpoint)` を受け取る。`checkpoint` は dict-like なオブジェクトで `joryu_migration_steps.progress` に永続化される：
-
-```python
-def upgrade():
-    op.add_column("users", "email_normalized", t.Text, nullable=True)
-
-    def backfill(conn, dialect, checkpoint):
-        cursor = checkpoint.get("last_id", 0)
-        while True:
-            rows = conn.execute(text(
-                "SELECT id, email FROM users "
-                "WHERE id > :c AND email_normalized IS NULL "
-                "ORDER BY id LIMIT 10000"
-            ), {"c": cursor}).fetchall()
-            if not rows:
-                return
-            conn.execute(text(
-                "UPDATE users SET email_normalized = LOWER(email) "
-                "WHERE id = ANY(:ids)"
-            ), {"ids": [r.id for r in rows]})
-            cursor = rows[-1].id
-            checkpoint.set("last_id", cursor)   # ← commit + 永続化
-
-    op.run_python(backfill)
-    op.alter_column("users", "email_normalized", nullable=False)
-```
-
-`checkpoint.set(key, value)` の挙動:
-- 値を `joryu_migration_steps.progress` に書き込み
-- joryu 制御下で commit する（ユーザの batch UPDATE と同一 transaction or 直後の commit、§9.5.3 で詳述）
-- 中断後の再実行時、`fn` が呼ばれる前に `checkpoint` には保存値がロードされている
-
-#### 9.5.2 冪等性ガイドライン（`run_python` を書く側の責任）
-
-`run_python` の中身は任意 Python なので、冪等性は **ユーザの責任**。joryu はこれを強制できない。実用ガイドライン：
-
-| パターン | 良い例 | 悪い例 |
-|---|---|---|
-| **WHERE で「未処理行のみ」を識別** | `WHERE email_normalized IS NULL` | `UPDATE users SET email_normalized = LOWER(email)`（再実行で全行 rescan） |
-| **追加処理は ON CONFLICT / WHERE NOT EXISTS** | `INSERT ... ON CONFLICT DO NOTHING` | 素の `INSERT`（再実行で重複） |
-| **cursor で順序ある進行** | `id > :cursor ORDER BY id` | offset/limit のみ（中断時に飛ばし or 重複） |
-| **副作用は DB 内のみ** | DB UPDATE のみ | HTTP 呼び出し、メール送信、外部 API（再実行で重複発火） |
-| **計算は決定論的** | 同じ入力で同じ出力 | `random()`、現在時刻依存（再実行で結果ずれ） |
-| **checkpoint を batch ごとに保存** | 1 batch ごとに `checkpoint.set` | ループ全体終了後にだけ set（中断時に進捗ロスト） |
-
-**index リンクの注意**: `WHERE email_normalized IS NULL AND id > :cursor` のような条件は `(email_normalized, id)` または少なくとも `id` に index がないと毎回フルスキャンになる。`run_python` を書くときは **必要な index を先行 step で作る** ことを意識する：
-
-```python
-def upgrade():
-    op.add_column("users", "email_normalized", t.Text, nullable=True)
-    # 未処理行の絞り込み用 partial index（処理完了後に drop してもよい）
-    op.create_index("tmp_users_unnormalized", "users", ["id"],
-                    where="email_normalized IS NULL")
-    op.run_python(backfill)
-    op.drop_index("tmp_users_unnormalized")
-    op.alter_column("users", "email_normalized", nullable=False)
-```
-
-#### 9.5.3 Checkpoint と batch の transaction 関係
-
-`checkpoint.set()` は **ユーザの直前の DML と同一 transaction でコミット** される。具体的には：
-
-```python
-# ユーザのコード:
-conn.execute(UPDATE...)        # batch UPDATE
-checkpoint.set("last_id", x)   # ← ここで joryu が COMMIT を実行
-```
-
-これにより「UPDATE は走ったが checkpoint が保存されず、再実行で同じ行を再 UPDATE」という重複処理を防ぐ。冪等な WHERE があれば重複しても無害だが、保証層として用意する。
-
-ユーザが明示的に transaction 制御したい場合は `transaction_mode = "none"` にして自分で `conn.commit()` + `checkpoint.set()` を呼ぶ：
-
-```python
-migration.transaction_mode = "none"
-
-def backfill(conn, dialect, checkpoint):
-    while ...:
-        with conn.begin():
-            conn.execute(UPDATE...)
-            checkpoint.set("last_id", x)   # commit はこの with 抜けで
-```
-
-### 9.6 適用アルゴリズム (`joryu apply`)
-
-1. アドバイザリロック取得（§9.7）
-2. `joryu_migrations` の `status='running'/'failed'` を **resume 対象** として認識
-3. 適用済み (`status='applied'`) と現在の方言で除外したものを除く、未適用 migration 集合を作る
-4. `depends_on` で DAG を構築、トポロジカルソート（同位は timestamp 昇順）
-5. resume + 未適用を順番に処理:
-   - 既存 `joryu_migrations` 行が無ければ INSERT (`status='running'`)、checksum 確認
-   - `transaction_mode` に応じて transaction を開く
-   - 各 step を順に実行:
-     - `joryu_migration_steps` を見て `done` なら skip
-     - `running` 中の batched op なら `progress` から再開
-     - 未処理なら `INSERT step (status='running')` → op 実行 → `UPDATE step (status='done')`
-     - 失敗時は `UPDATE step (status='failed')` → migration を `failed` に → 停止
-   - 全 step 完了で `UPDATE migrations (status='applied', finished_at=...)`
-6. lock 解放
-
-### 9.7 アドバイザリロック
-
-複数プロセス同時実行を防ぐ：
+Prevents concurrent processes:
 - Postgres: `pg_advisory_lock`
 - MySQL: `GET_LOCK`
-- SQLite: `BEGIN EXCLUSIVE` または file lock
+- SQLite: `BEGIN EXCLUSIVE` or a file lock
 
-### 9.8 失敗時の運用フロー
+---
+
+## 10. Failure handling and resumption
+
+### 10.1 Operational flow on failure
 
 ```
 joryu apply
-  → migration X の step 3 (batched_update) で 50% 進んだところで OOM kill
+  → migration X, step 3 (run_python backfill) reaches 50% then OOM-kills
   → status='failed', steps[3].status='failed', steps[3].progress='{"cursor": 5012345}'
 
-調査 (DB の負荷確認、原因特定)
+investigate (DB load, root cause)
 
-joryu status              # X が failed であることを表示、進捗も
-joryu apply --resume      # step 1, 2 は skip, step 3 を cursor から続行
+joryu status              # shows X is failed and its progress
+joryu apply --resume      # skip steps 1, 2; resume step 3 from the cursor
 ```
 
-`--resume` を明示しない apply はデフォルトで resume する（明示的に止めたいときは `--no-resume`）。
+`apply` resumes by default; pass `--no-resume` to disable.
 
-`joryu mark <id> --as=applied` や `joryu mark <id> --as=pending` で手動状態修正も可能（最後の手段）。
+`joryu mark <id> --as=applied` and `joryu mark <id> --as=pending` allow manual state correction (last resort).
 
-### 9.9 DDL 多段失敗（典型シナリオ）
+### 10.2 Multi-stage DDL failure (typical scenario)
 
-データ移行ではなく **複数 DDL の途中で失敗** するパターン。実運用で頻出する：
+Not data migration but a failure midway through multiple DDLs. Common in practice:
 
 ```python
 def upgrade():
     op.add_column("users", "col1", t.Text)
     op.add_column("users", "col2", t.Text)
-    op.create_index("idx_col2", "users", ["col2"])   # ← 失敗（同名 index が既存等）
+    op.create_index("idx_col2", "users", ["col2"])   # ← fails (duplicate index name, etc.)
     op.add_column("users", "col3", t.Text)
 ```
 
-per_step モードでの動作:
+Behavior in `per_step` mode:
 
 ```
-Step 1: ALTER TABLE ADD col1   → BEGIN; ...; COMMIT;  ✓
-Step 2: ALTER TABLE ADD col2   → BEGIN; ...; COMMIT;  ✓
-Step 3: CREATE INDEX idx_col2  → 失敗 → ROLLBACK (Postgres) / 暗黙状態 (MySQL)
-Step 4: ALTER TABLE ADD col3   → 未実行で停止
+Step 1: ALTER TABLE ADD col1   → BEGIN; ...; COMMIT;  ok
+Step 2: ALTER TABLE ADD col2   → BEGIN; ...; COMMIT;  ok
+Step 3: CREATE INDEX idx_col2  → fails → ROLLBACK (Postgres) / implicit state (MySQL)
+Step 4: ALTER TABLE ADD col3   → not executed, halted
 ```
 
-**実 DB の状態**: col1/col2 あり、idx_col2 なし、col3 なし。
-**`joryu_migration_steps`**: 1=done, 2=done, 3=failed, 4=pending。
+**Real DB state**: col1 / col2 present, idx_col2 absent, col3 absent.
+**`joryu_migration_steps`**: 1=done, 2=done, 3=failed, 4=pending.
 
-復旧パスは 3 通り:
+Three recovery paths:
 
-| パス | 操作 | 結果 |
+| Path | Action | Result |
 |---|---|---|
-| **A. 原因除去して継続** | 既存 idx_col2 を drop、`joryu apply` 再実行 | step 1,2 は ensure semantics で skip、step 3 retry → step 4 実行 |
-| **B. ファイル修正** | index 名を `idx_col2_v2` に変えて push、`joryu apply` | failed 中なので checksum 変更可（§9.10）、step 3 が新 fingerprint で実行 → step 4 |
-| **C. 放棄** | `joryu mark <id> --as=pending` + col1/col2 を手 drop、または `--as=applied` で完了扱い | 後者は嘘だが、後続 migration は ensure semantics で現状認識して整合 |
+| **A. Remove the cause and continue** | Drop the conflicting idx_col2, re-run `joryu apply` | Steps 1, 2 skip via ensure; step 3 retries; step 4 runs |
+| **B. Edit the file** | Rename the index to `idx_col2_v2`, push, re-run `joryu apply` | While `failed`, checksum changes are allowed (§10.3); step 3 runs with a new fingerprint; step 4 runs |
+| **C. Abandon** | `joryu mark <id> --as=pending` + manually drop col1 / col2, *or* `--as=applied` to call it done | The latter lies, but ensure semantics in later migrations will still reconcile to actual state |
 
-### 9.10 Failed 中の checksum / op_fingerprint ポリシー
+### 10.3 Checksum / `op_fingerprint` policy in failed state
 
-| 状態 | ファイル checksum 変更 | step の op_fingerprint 変更 |
+| State | File checksum change | Step `op_fingerprint` change |
 |---|---|---|
-| `applied` | **禁止** (§7.1)、`joryu repair` 必須 | — |
-| `failed` | **許可**（修正して再 push が通常運用） | 失敗 step 以前: 一致必須。失敗 step 以降: 変更可、新内容で実行 |
-| `running` | 通常は起きない（同時実行は advisory lock で防止） | — |
-| 未実行 | 自由 | — |
+| `applied` | **forbidden** (§7.1); requires `joryu repair` | — |
+| `failed` | **allowed** (fix + push is the normal flow) | Before the failed step: must match. From the failed step onward: changeable; new content is executed. |
+| `running` | should not happen (concurrency blocked by advisory lock) | — |
+| Not yet started | free | — |
 
-「失敗 step 以前の fingerprint 変更を ERROR にする」のは大事。step 1 を勝手に書き換えて再実行すると、DB の col1 が既に存在するため ensure で skip → 変更が反映されない、という silent な事故になる。
+Erroring on a fingerprint change *before* the failed step matters: silently rewriting step 1 and re-running would find col1 already present, skip the step via ensure, and silently lose the new intent.
 
-### 9.11 Failed / paused migration がある時の後続 migration
+### 10.4 Behavior when a failed / paused migration exists
 
-migration X が `failed` または `paused` のとき、別の migration Y を実行するか？
+If migration X is `failed` or `paused`, should a different migration Y be allowed to run?
 
-- **デフォルト: halt**。`failed` または `paused` が 1 つでもあれば `joryu apply` は何もせず終了し、`joryu status` を見るよう促す。終了コードは `failed` があれば `2`、`paused` のみであれば `3`（両方ある場合は `2` を優先 — failed の方が解決優先度が高い）
-- **`failed` の明示許可**: `joryu apply --continue-past-failed` で、failed に depends_on で繋がっていない migration のみ実行（`paused` には適用されない — `paused` は復帰可能なため迂回ではなく再開を期待する設計）
-- **`paused` の処理**: `joryu apply --retry-paused [--retry-interval=N]` で paused migration の再開を試行。再開できなかった (依然 paused) 場合は exit code 3 で終了。後続 migration の自動迂回は無い（明示的に skip したいなら `joryu mark <id> --as=failed` で failed に遷移させた後 `--continue-past-failed` を使う）
-- 理由: 失敗は例外イベント。気付かないうちに別 migration が動いて状態が複雑化することを避ける
+- **Default: halt.** If any migration is `failed` or `paused`, `joryu apply` does nothing and asks the user to consult `joryu status`. Exit code is `2` if any `failed` exists, or `3` if only `paused` (both present: `2` wins — `failed` takes priority).
+- **Explicit `failed` override**: `joryu apply --continue-past-failed` runs only migrations not transitively dependent (via `depends_on`) on the failed one. Does not apply to `paused` (paused is recoverable, so the design expects resumption, not bypass).
+- **`paused` handling**: `joryu apply --retry-paused [--retry-interval=N]` retries paused migrations. If still paused after retries, exit with code 3. There is no automatic bypass for subsequent migrations; to skip explicitly, transition the migration to `failed` via `joryu mark <id> --as=failed` and then use `--continue-past-failed`.
+- Rationale: failure is an exceptional event; running other migrations unnoticed would complicate the state.
 
-### 9.12 Downgrade の現実と AI フレンドリーなアプローチ
+### 10.5 Interactive recovery from a half-failed state
 
-> Downgrade は「逆順に消す」だけでは動かない。FK・index・依存関係を考慮した順序が必要で、Alembic の auto 生成 down は実運用で **そのままでは動かない** ことが多い。
-> joryu は本番 down を非推奨とした上で、**dev 用 down を AI が完成させやすい構造** にする。
+When step 2 was a `run_python` that completed 50%, and step 3 raised — `joryu apply --resume` prompts for the recovery strategy:
 
-#### 9.12.1 なぜ素朴な逆順が動かないか
+```
+$ joryu apply
+Migration 20260620T030000_backfill_email_normalized is in failed state.
 
-典型的な失敗：
-- `create_index` の逆 `drop_index` が、その index が FK に参照されていて drop 不可
-- `create_table` の逆 `drop_table` が、別テーブルからの FK で参照されて drop 不可
-- `add_column NOT NULL` の逆 `drop_column` で、その列を参照する view・FK・index が残っている
-- データ移行 (`run_python` で値を変換) の逆処理が原理的に書けない（情報損失）
+  ✓ step 1 add_column(users.email_normalized)  done
+  ⚠ step 2 run_python(backfill)                done at last_id=15003421 (30%)
+  ✗ step 3 alter_column(... NOT NULL)          failed: NotNullViolation
 
-Alembic の auto-generated downgrade はこれらを考慮せず素朴な逆順を吐くので、実運用では人間が書き直すか、down を諦めることになる。
+How would you like to proceed?
+  [1] Resume from step 3 (re-run only failed/pending steps)
+  [2] Restart from step 2 (re-run from a chosen step)  ← prompt for step number
+  [3] Restart from step 1 (full restart, clears all checkpoints)
+  [4] Skip step 3 and continue (mark as skipped)
+  [5] Abort (do nothing)
 
-#### 9.12.2 `JORYU-DOWN-HINT:` 構造化コメント仕様（v1 固定）
+Choose [1-5]:
+```
 
-> **言語ポリシー**: HINT のフィールド名・enum 値はすべて **英語固定** とする（CLAUDE.md の言語ポリシーに従う）。AI ツールが安定して読み取れることが目的。
+- Default is `[1]` (resume).
+- `--non-interactive --on-failure=resume|restart|abort` selects behavior for CI / automation.
+- `[3]` clears all checkpoints; ensure-style ops still skip on re-run, but `run_python` starts from scratch — safe only if the user's WHERE clause is idempotent.
+- `[4]` skip is recorded as metadata and visible in `joryu status`.
 
-`joryu generate` は upgrade と同時に **downgrade のスケルトン** と **構造化ヒント** を出力する。完成は AI または人間に任せる。HINT は YAML 風 key-value で書かれ、`JORYU-DOWN-HINT:` プレフィクスを持つ：
+---
+
+## 11. Downgrade
+
+> "Reverse order and drop everything" does not work in practice. FKs, indexes, and dependencies require a specific order. Alembic's auto-generated `downgrade` rarely runs as-is.
+> joryu discourages downgrade in production and structures dev-only downgrade so AI can complete it.
+
+### 11.1 Why naive reverse order fails
+
+Typical failures:
+- The inverse of `create_index` (a `drop_index`) cannot drop the index because an FK references it.
+- The inverse of `create_table` cannot drop the table because another table has an FK pointing at it.
+- The inverse of `add_column NOT NULL` cannot drop the column because a view, FK, or index still references it.
+- The inverse of a data migration (`run_python` that transforms values) is fundamentally unwritable (information loss).
+
+Alembic's auto-generated downgrade ignores these and emits naïve reverse order, so in production people either rewrite it by hand or skip downgrade entirely.
+
+### 11.2 The `JORYU-DOWN-HINT:` structured-comment spec (frozen in v1)
+
+> **Language policy**: HINT field names and enum values are English (per the language policy in CLAUDE.md). The goal is stable AI parsing.
+
+`joryu generate` produces both an upgrade and a downgrade skeleton plus structured hints. Completion is left to AI or human. Hints are YAML-like key-value lines prefixed with `JORYU-DOWN-HINT:`:
 
 ```python
 def downgrade():
@@ -856,7 +822,7 @@ def downgrade():
     op.drop_column("users", "email_normalized")
 ```
 
-**Field vocabulary (v1, 固定)**:
+**Field vocabulary (v1, frozen)**:
 
 | Field | Type | Description | Required |
 |---|---|---|---|
@@ -884,28 +850,28 @@ def downgrade():
 - `trigger: <name> -> <table>`
 - `policy: <name> -> <table>` (RLS)
 
-**Generator の責任**:
-- `schema-impact`, `order-constraint`: upgrade の op から機械的に導出
-- `cross-references`: 生成時点の DB スキーマ（or `--against=replay` で再構築した仮想スキーマ）をスキャンして検出
-- `data-loss-risk`: heuristic — `drop_column` / `drop_table` / `run_python` を含めば `high`、純粋な index/constraint drop は `low`、何もデータに触れない構造変更は `none`
-- `requires-app-knowledge`: `run_python` / `op.execute(raw_sql)` を含むなら `true`
+**Generator responsibilities**:
+- `schema-impact`, `order-constraint`: derived mechanically from upgrade ops.
+- `cross-references`: scan the current DB schema (or the virtual schema reconstructed via `--against=replay`) at generation time.
+- `data-loss-risk`: heuristic — `drop_column` / `drop_table` / `run_python` → `high`; pure index/constraint drop → `low`; schema-only changes that don't touch data → `none`.
+- `requires-app-knowledge`: `true` if the migration contains `run_python` / `op.execute(raw_sql)`.
 
-**AI の責任** (downgrade を完成させるとき):
-- `schema-impact` を読んで drop 順序を決定（`order-constraint` を尊重）
-- `cross-references` を読んで先行で drop すべき対象を追加
-- `data-loss-risk: irreversible` の場合は downgrade をコメントアウトして人間に判断を委ねる
-- 完成したら `completion-status: complete` に更新
+**AI responsibilities** (when completing downgrade):
+- Read `schema-impact` to plan drop order (respecting `order-constraint`).
+- Read `cross-references` to add drops for dependent objects.
+- If `data-loss-risk: irreversible`, comment out the downgrade body and let a human decide.
+- On completion, update `completion-status: complete`.
 
-#### 9.12.3 AI が利用するインプット
+### 11.3 AI inputs
 
-AI ツール（Claude Code 等）が downgrade を補完するとき、以下を組み合わせる：
+When an AI tool (e.g., Claude Code) completes a downgrade, it combines:
 
-1. `JORYU-DOWN-HINT:` の構造化フィールド
-2. SQLAlchemy モデル定義（`models/` 配下、FK・関係）
-3. `joryu schema-snapshot --format=json` が出力する現在 DB schema
-4. 同 migration の `upgrade()` 本体
+1. The `JORYU-DOWN-HINT:` structured fields.
+2. SQLAlchemy model definitions under `models/` (FKs, relationships).
+3. The current DB schema as emitted by `joryu schema-snapshot --format=json`.
+4. The body of `upgrade()` in the same migration.
 
-**AI 向け標準プロンプト** (README で配布):
+**Standard AI prompt** (shipped in the README):
 
 ```
 Complete the downgrade() in this migration file. Use the JORYU-DOWN-HINT: comments
@@ -915,47 +881,49 @@ body and add a clear note explaining why. Update completion-status when done.
 Do not modify the upgrade() function.
 ```
 
-#### 9.12.4 down の位置づけ（明文化）
+### 11.4 Positioning of downgrade (explicit)
 
-| 環境 | down の使用 | 推奨 |
+| Environment | Downgrade usage | Recommendation |
 |---|---|---|
-| ローカル dev | OK（試行錯誤・branch 切り替え） | 通常運用 |
-| ステージング | 限定的（FK 等で破綻しやすい） | 慎重に |
-| 本番 | **非推奨** | PITR / バックアップで戻す |
+| Local dev | OK (experimentation, branch switching) | Normal workflow |
+| Staging | Limited (often breaks on FKs etc.) | With caution |
+| Production | **Discouraged** | Use PITR / backups instead |
 
-`joryu down` は **--allow-prod なしでは production-like な接続を拒否** する（DSN や設定で本番判定）。事故防止。
+`joryu down` refuses production-like connections unless `--allow-prod` is passed (production detection is by DSN / config). Accident prevention.
 
-### 9.13 過去スキーマの参照（履歴リプレイ）
+---
 
-Django と同じく、Operations が宣言的なので joryu は **任意の時点のスキーマを再構築可能**。
-データ移行関数内で「過去のモデル形」を参照したい場合：
+## 12. Historical schema replay
+
+As in Django, joryu can reconstruct the schema at any past point because Operations are declarative.
+Inside a data-migration function, refer to the schema as it was at that migration:
 
 ```python
 def upgrade():
-    OldUser = op.historical_model("users")    # 当該時点のスキーマ
+    OldUser = op.historical_model("users")    # the schema at this migration
     def backfill(conn, dialect, checkpoint):
         for row in conn.execute(select(OldUser).where(OldUser.c.email.is_(None))):
             ...
     op.run_python(backfill)
 ```
 
-これにより「アプリの `models.User` を import すると現状最新形になっていて壊れる」という Alembic でよくある事故を回避できる。
+This avoids the Alembic-style accident "I imported `models.User` and it had drifted to the current shape, breaking my migration."
 
-#### 9.13.1 リプレイ方式: Operations replay (snapshot ファイルなし)
+### 12.1 Replay strategy: Operations replay (no snapshot files)
 
-joryu は **Operations replay 方式** を採用。snapshot JSON ファイル（Drizzle 流）は持たない：
-- `joryu generate` 時、対象 migration の前までの全 Operations をメモリ上の virtual schema に順次適用して「現在状態」を構築
-- そこに対して新 migration の op を適用して比較・差分を出す
-- snapshot ファイルを増やさないので PR 衝突源にならない、git diff がノイジーにならない
+joryu uses Operations-replay. No snapshot JSON files (the Drizzle approach):
+- At `joryu generate` time, replay every Operation up to (but excluding) the target migration into an in-memory virtual schema to obtain "current state."
+- Apply the target migration's ops on top and compute the diff.
+- Without snapshot files, PRs don't conflict on snapshots and git diffs stay clean.
 
-#### 9.13.2 Raw SQL / run_python の扱い
+### 12.2 Raw SQL / `run_python` handling
 
-`op.execute(raw_sql)` や `op.run_python(...)` は中身が不透明で virtual schema に自動反映できない。これらを含む migration では、ユーザが **declarative ヒント** を併記する:
+`op.execute(raw_sql)` and `op.run_python(...)` are opaque to the virtual schema. For migrations that contain them, the user adds a **declarative hint**:
 
 ```python
 def upgrade():
     op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
-    op.declare_schema_change(extension_added="pgcrypto")     # replay 用ヒント
+    op.declare_schema_change(extension_added="pgcrypto")     # hint for replay
 
     op.execute("ALTER TABLE users ADD COLUMN api_key TEXT GENERATED ALWAYS AS (...) STORED")
     op.declare_schema_change(
@@ -965,24 +933,24 @@ def upgrade():
     def transform(conn, dialect, checkpoint):
         conn.execute(text("UPDATE users SET ..."))
     op.run_python(transform)
-    # データ変更は schema に影響しないので declare 不要
+    # Data-only changes don't affect the schema, so no declare needed.
 ```
 
-**ヒントが無い場合**:
-- replay は当該 migration を「opaque box」として扱い、以降の `historical_model()` はその migration より前の状態に固定される
-- `joryu generate` は warning を出す: "historical schema may be stale after migration X due to undeclared raw SQL"
-- ただしエラーにはしない（最も多くの run_python はデータ変更のみで schema 影響なし）
+**Without a hint**:
+- Replay treats the migration as an opaque box; subsequent `historical_model()` calls are pinned to the pre-migration state.
+- `joryu generate` warns: "historical schema may be stale after migration X due to undeclared raw SQL."
+- It does not error (most `run_python` calls are data-only and don't affect schema).
 
-`op.declare_schema_change(...)` の引数は `op.add_column` 等と同じ語彙のサブセット。
+`op.declare_schema_change(...)` uses a subset of the same vocabulary as the other `op.*` calls.
 
-**v1 で固定の語彙**:
+**v1 frozen vocabulary**:
 
-| カテゴリ | キーワード |
+| Category | Keywords |
 |---|---|
 | Column | `column_added`, `column_dropped`, `column_altered`, `column_renamed` |
 | Table | `table_added`, `table_dropped`, `table_renamed` |
 | Index | `index_added`, `index_dropped` |
-| Constraint | `constraint_added`, `constraint_dropped` (kind=`fk`\|`unique`\|`check`) |
+| Constraint | `constraint_added`, `constraint_dropped` (kind=`fk` \| `unique` \| `check`) |
 | Extension (PG) | `extension_added`, `extension_dropped` |
 | Enum | `enum_added`, `enum_dropped`, `enum_value_added` |
 | View | `view_added`, `view_dropped` |
@@ -992,7 +960,7 @@ def upgrade():
 | Sequence | `sequence_added`, `sequence_dropped` |
 | Schema (PG) | `schema_added`, `schema_dropped` |
 
-語彙は v1 で固定（破壊的変更しない）。後方互換で追加は可能。複数 keyword を 1 回の呼び出しで渡せる:
+This vocabulary is frozen in v1 (no breaking changes). Backward-compatible additions are allowed. Multiple keywords can be passed in one call:
 ```python
 op.declare_schema_change(
     column_added=("users", "api_key", t.Text, {"nullable": False, "generated": True}),
@@ -1000,25 +968,25 @@ op.declare_schema_change(
 )
 ```
 
-各 keyword の引数 tuple 形:
+Tuple shape per keyword:
 
-| キーワード | tuple 形 |
+| Keyword | Tuple shape |
 |---|---|
 | `column_added` | `(table, column_name, type, opts: dict)` |
 | `column_dropped` | `(table, column_name)` |
-| `column_altered` | `(table, column_name, {"old": ..., "new": ...})` — `old` / `new` は `{"type": ..., "nullable": ..., "default": ...}` の dict |
+| `column_altered` | `(table, column_name, {"old": ..., "new": ...})` — `old` / `new` are dicts of `{"type": ..., "nullable": ..., "default": ...}` |
 | `column_renamed` | `(table, old_name, new_name)` |
 | `table_added` | `(table_name, {"columns": [...], "options": {...}})` |
 | `table_dropped` | `(table_name,)` |
 | `table_renamed` | `(old_name, new_name)` |
 | `index_added` | `(index_name, table, [columns], opts: dict)` |
 | `index_dropped` | `(index_name, table)` |
-| `constraint_added` | `(constraint_name, table, {"kind": "fk"\|"unique"\|"check", ...kind 別 fields})` — fk なら `referred_table` / `referred_columns` / `local_columns`、unique なら `columns`、check なら `expression` |
+| `constraint_added` | `(constraint_name, table, {"kind": "fk" \| "unique" \| "check", ...kind-specific fields})` — fk: `referred_table` / `referred_columns` / `local_columns`; unique: `columns`; check: `expression` |
 | `constraint_dropped` | `(constraint_name, table, {"kind": ...})` |
 | `extension_added` / `extension_dropped` | `(name,)` |
 | `enum_added` | `(name, [labels])` |
 | `enum_dropped` | `(name,)` |
-| `enum_value_added` | `(name, label, {"before": neighbor}\|{"after": neighbor}\|{})` |
+| `enum_value_added` | `(name, label, {"before": neighbor} \| {"after": neighbor} \| {})` |
 | `view_added` / `materialized_view_added` | `(name, sql)` |
 | `view_dropped` / `materialized_view_dropped` | `(name,)` |
 | `trigger_added` | `(name, table, definition_sql)` |
@@ -1028,21 +996,116 @@ op.declare_schema_change(
 | `sequence_added` / `sequence_dropped` | `(name,)` |
 | `schema_added` / `schema_dropped` | `(name,)` |
 
-複数同じ keyword を一度に宣言したいときは値を tuple の list にする（`column_added=[(...), (...)]`）。
+For multiple instances of the same keyword in one call, pass a list of tuples (`column_added=[(...), (...)]`).
 
-**v1 で意図的に未収録**: `index_renamed`（Operations API に `op.rename_index` が無いため。raw SQL で index rename を行う場合は `column_renamed` 同様の独自宣言は v2 以降で検討）。
+**Intentionally omitted from v1**: `index_renamed` (no `op.rename_index` exists in the Operations API). If renaming an index via raw SQL is needed, a dedicated declaration (analogous to `column_renamed`) will be considered in v2+.
 
-### 9.14 ユーザ定義 step (`op.step`)
+---
 
-> Migration は「op を順に並べた step 列」だが、ユーザが任意の処理を 1 step として登録できる。
-> 完了判定をカスタマイズでき、resume / pause も組み込みの step と同じ扱いになる。
+## 13. User-defined steps and checkpoints
 
-#### 9.14.1 基本形
+### 13.1 Resumable data migrations (`op.run_python` + checkpoints)
+
+> **Design rationale**: joryu does *not* provide a general-purpose `batched_update` API.
+> Reasons:
+> - The library cannot statically verify that WHERE clauses and indexes are consistent. A "use this, you're safe" API would mislead.
+> - Batching strategy depends on data shape and index structure (cursor / range / ctid / SKIP LOCKED). Any general API leaks.
+> - The batching loop itself is small. The library's real value is checkpoint persistence and resumption.
+>
+> Instead, joryu provides only the checkpoint infrastructure; the user writes the batching loop.
+
+#### 13.1.1 The `op.run_python` checkpoint API
+
+The `fn` passed to `op.run_python(fn)` receives `(connection, dialect, checkpoint)`. `checkpoint` is a dict-like object persisted to `joryu_migration_steps.progress`:
+
+```python
+def upgrade():
+    op.add_column("users", "email_normalized", t.Text, nullable=True)
+
+    def backfill(conn, dialect, checkpoint):
+        cursor = checkpoint.get("last_id", 0)
+        while True:
+            rows = conn.execute(text(
+                "SELECT id, email FROM users "
+                "WHERE id > :c AND email_normalized IS NULL "
+                "ORDER BY id LIMIT 10000"
+            ), {"c": cursor}).fetchall()
+            if not rows:
+                return
+            conn.execute(text(
+                "UPDATE users SET email_normalized = LOWER(email) "
+                "WHERE id = ANY(:ids)"
+            ), {"ids": [r.id for r in rows]})
+            cursor = rows[-1].id
+            checkpoint.set("last_id", cursor)   # ← commit + persist
+```
+
+`checkpoint.set(key, value)` behavior:
+- Writes the value to `joryu_migration_steps.progress`.
+- Commits under joryu's control (in the same transaction as the user's batch UPDATE, or immediately after; see §13.1.3).
+- On restart, `checkpoint` is preloaded with the persisted values before `fn` runs.
+
+#### 13.1.2 Idempotency guidelines (responsibility of the `run_python` author)
+
+The body of `run_python` is arbitrary Python; idempotency is the user's responsibility — joryu cannot enforce it. Practical guidance:
+
+| Pattern | Good | Bad |
+|---|---|---|
+| **Filter "unprocessed only" with WHERE** | `WHERE email_normalized IS NULL` | `UPDATE users SET email_normalized = LOWER(email)` (rescans every row on re-run) |
+| **Use ON CONFLICT / WHERE NOT EXISTS on inserts** | `INSERT ... ON CONFLICT DO NOTHING` | bare `INSERT` (duplicates on re-run) |
+| **Cursor-based ordered progression** | `id > :cursor ORDER BY id` | offset/limit alone (skips or duplicates on interruption) |
+| **Side effects only inside the DB** | DB UPDATE only | HTTP calls, email sends, external APIs (re-fire on resume) |
+| **Deterministic computation** | Same input, same output | `random()`, current-time-dependent values (drift on resume) |
+| **Checkpoint per batch** | `checkpoint.set` on each batch | Only `set` after the whole loop (progress lost on interruption) |
+
+**Index hint**: a predicate like `WHERE email_normalized IS NULL AND id > :cursor` will do a full scan every iteration unless an index on `(email_normalized, id)` (or at least `id`) exists. When writing `run_python`, create the supporting indexes in an earlier step:
+
+```python
+def upgrade():
+    op.add_column("users", "email_normalized", t.Text, nullable=True)
+    # Partial index narrowing unprocessed rows (drop after backfill).
+    op.create_index("tmp_users_unnormalized", "users", ["id"],
+                    where="email_normalized IS NULL")
+    op.run_python(backfill)
+    op.drop_index("tmp_users_unnormalized")
+    op.alter_column("users", "email_normalized", nullable=False)
+```
+
+#### 13.1.3 Checkpoint and batch transaction relationship
+
+`checkpoint.set()` is committed in the *same* transaction as the immediately preceding DML:
+
+```python
+# User code:
+conn.execute(UPDATE...)        # batch UPDATE
+checkpoint.set("last_id", x)   # ← joryu issues COMMIT here
+```
+
+This prevents "UPDATE ran but checkpoint wasn't saved, so the next run double-processes the same rows." An idempotent WHERE makes duplicates harmless, but this provides a defensive guarantee.
+
+When the user needs explicit transaction control, set `transaction_mode = "none"` and manage transactions manually:
+
+```python
+migration.transaction_mode = "none"
+
+def backfill(conn, dialect, checkpoint):
+    while ...:
+        with conn.begin():
+            conn.execute(UPDATE...)
+            checkpoint.set("last_id", x)   # commit happens at with-exit
+```
+
+### 13.2 User-defined steps (`op.step`)
+
+> A migration is a sequence of step ops, but any user code can register as a step.
+> Completion logic is customizable, and resume / pause behave the same as built-in steps.
+
+#### 13.2.1 Basics
 
 ```python
 @op.step
 def wait_for_replication(conn, dialect, checkpoint):
-    """前段の DDL がレプリカに反映されるまで待つカスタム step。"""
+    """Wait for prior DDL to propagate to a replica."""
     if checkpoint.get("ready"):
         return True
 
@@ -1053,40 +1116,40 @@ def wait_for_replication(conn, dialect, checkpoint):
     raise op.PauseStep(f"replica lag={lag}s, retry later")
 ```
 
-`op.step` は 3 つの呼び出し形をサポートする:
+`op.step` supports three call forms:
 ```python
 @op.step                                       # bare decorator
 def my_func(conn, dialect, checkpoint): ...
 
-@op.step(name="...", description="...")        # decorator factory（メタデータ指定）
+@op.step(name="...", description="...")        # decorator factory (with metadata)
 def my_func(conn, dialect, checkpoint): ...
 
-op.step(my_func, name="...", description="...")  # 直接呼び出し（既存関数の登録）
+op.step(my_func, name="...", description="...")  # direct call (register an existing function)
 ```
 
-**返り値**: いずれの形も **元の関数オブジェクトをそのまま返す**（登録は副作用として registry に積むだけ）。これにより:
-- デコレートされた関数はテストから直接呼び出せる (`my_func(conn, dialect, checkpoint)`)。
-- `inspect.iscoroutinefunction(my_func)` の判定が壊れない（§9.14.2 の sync/async 振り分けに必要）。
-- `@op.step` と `@op.step(...)` で型シグネチャが異ならない（decorator factory も `Callable[F, F]` を返す）。
+**Return value**: every form returns the original function unchanged (registration is a side effect that appends to the registry). This means:
+- The decorated function is callable directly from tests (`my_func(conn, dialect, checkpoint)`).
+- `inspect.iscoroutinefunction(my_func)` still works (needed for the sync/async dispatch in §13.2.2).
+- The type signature of `@op.step` and `@op.step(...)` doesn't differ (the decorator factory also returns `Callable[F, F]`).
 
-- `name`: step の識別子・`joryu status` 等の表示名（既定は関数名）
-- `description`: `describe()` が返す 1 行説明（既定は docstring の 1 行目、無ければ name）
-- 実行時の判別ロジック:
-  1. 位置引数が 1 つあり、それが callable なら **bare decorator もしくは直接呼び出し** として扱い、その関数を即時登録（両者は意味的に同じ — `@op.step` も `op.step(fn)` も同等の登録呼び出しになる）。
-  2. 位置引数が無くキーワード引数 (`name=` / `description=`) のみなら **decorator factory** として扱い、関数を受け取る wrapper を返す。
-  3. 上記いずれにも当てはまらない呼び出しは即時 `TypeError`。
+- `name`: identifier and display name in `joryu status` (defaults to the function name).
+- `description`: 1-line description returned by `describe()` (defaults to the docstring's first line, or `name`).
+- Dispatch logic at runtime:
+  1. If there is one positional argument and it is callable, treat it as **bare decorator or direct call** and register it immediately (the two are semantically identical — `@op.step` and `op.step(fn)` are equivalent registration calls).
+  2. If there are no positional arguments and only kwargs (`name=` / `description=`), treat it as a **decorator factory** and return a wrapper that accepts the function.
+  3. Anything else raises `TypeError`.
 
-#### 9.14.2 シグネチャと返り値
+#### 13.2.2 Signature and return values
 
-シグネチャ: `fn(conn, dialect, checkpoint) -> bool | None`
-- **同期関数が一級市民**: SQLAlchemy Core/ORM を使う通常のクエリ実行が想定される最頻パターン
-- **`async def` も対応**: 外部 IO 待機 (HTTP 呼び出し、replication 待ち等) で必要なケース
-- 判別: `inspect.iscoroutinefunction(fn)` → True なら **anyio** runner で実行、False ならそのまま同期実行
-- 引数を不要なら `*args, **kwargs` で受けて無視するか、`fn()` のような無引数定義も許可
-- 同一 migration 内に sync / async step を混在可
+Signature: `fn(conn, dialect, checkpoint) -> bool | None`
+- **Sync functions are first-class**: the common case (SQLAlchemy Core/ORM queries).
+- **`async def` is supported**: required when waiting on external I/O (HTTP, replication wait, etc.).
+- Dispatch: `inspect.iscoroutinefunction(fn)` → True runs on the **anyio** runner; False runs synchronously.
+- Arguments may be received as `*args, **kwargs` and ignored, or as a zero-arg `fn()`.
+- Sync and async steps may coexist in the same migration.
 
 ```python
-# Sync (典型、SQLAlchemy)
+# Sync (typical, SQLAlchemy)
 @op.step
 def normalize_user_data(conn, dialect, checkpoint):
     rows = conn.execute(select(User).where(User.normalized.is_(None))).all()
@@ -1094,7 +1157,7 @@ def normalize_user_data(conn, dialect, checkpoint):
         conn.execute(update(User).where(User.id == r.id).values(normalized=r.name.lower()))
     return True
 
-# Async (外部 IO)
+# Async (external I/O)
 @op.step
 async def wait_for_webhook(conn, dialect, checkpoint):
     async with httpx.AsyncClient() as c:
@@ -1102,159 +1165,136 @@ async def wait_for_webhook(conn, dialect, checkpoint):
     return r.status_code == 200
 ```
 
-**runtime 選定**: 内部実装は **anyio** を使う（asyncio 直接ではない）。理由:
-- asyncio + trio の両対応で将来性
-- TaskGroup 等の structured concurrency が綺麗
-- 同期コードを async runner 内から `anyio.from_thread.run_sync` で呼べる相互運用性
+**Runtime choice**: internally uses **anyio** (not raw asyncio). Reasons:
+- Supports both asyncio and trio, future-proof.
+- Clean structured concurrency via TaskGroup et al.
+- Interop: sync code can be invoked from the async runner via `anyio.from_thread.run_sync`.
 
-**呼び出し側のイベントループ前提**: joryu の CLI / API は同期コンテキストから呼ばれることを前提とし、async step は内部で `anyio.run(...)` を使って独自のイベントループを起動する。
-- 呼び出し側が既に async ランタイム上 (FastAPI background task、`pytest-anyio`、Jupyter 等) で `joryu.apply()` を実行する場合、`anyio.run()` は `RuntimeError: nested event loops` で失敗する。
-- そのケースでは `await joryu.apply_async(...)` を使うこと（v1 で提供）。`apply_async` は呼び出し側のループを再利用し、内部 step を直接 `await` する。
-- nesting を黙って許容するための `nest_asyncio` 系パッチは採用しない（デバッグ困難な挙動の温床になるため）。
+**Caller event-loop assumptions**: joryu's CLI / API assumes a synchronous calling context; async steps start their own loop with `anyio.run(...)`.
+- If the caller is already on an async runtime (FastAPI background task, `pytest-anyio`, Jupyter, etc.) and invokes `joryu.apply()`, `anyio.run()` fails with `RuntimeError: nested event loops`.
+- For that case, use `await joryu.apply_async(...)` (shipped in v1). `apply_async` reuses the caller's loop and `await`s steps directly.
+- Patches like `nest_asyncio` are *not* adopted (they create hard-to-debug behavior).
 
-返り値の意味:
+Completion semantics. A step signals its outcome either by returning a value or by raising one of two control-flow exceptions. joryu's step runner catches `PauseStep` and `SkipStep` specifically *before* the generic exception handler; any other exception propagates as failure.
 
-| 返り値 | 意味 | step status |
-|---|---|---|
-| `True` / `None` (return 省略) | 完了 | `done` |
-| `False` | 完了ではないが ERROR でもない（再実行待ち） | `pending` のまま、次回 apply で続行 |
-| 例外 `op.PauseStep(reason)` | 外部要因で待機（migration 全体を停止、再実行で再開） | step `pending`、migration `paused` |
-| 例外 `op.SkipStep(reason)` | この step は skip して次へ | step `skipped` |
-| その他例外 | 失敗 | step `failed`、migration `failed` |
+| Outcome | How produced | Meaning | Step status |
+|---|---|---|---|
+| return `True` / `None` | `return True` or `return` | Done | `done` |
+| return `False` | `return False` | Not done, but not an error (retry later) | stays `pending`, re-runs next apply |
+| `op.PauseStep(reason)` | `raise op.PauseStep(...)` | External wait (halt migration, resume on rerun) | step `pending`, migration `paused` |
+| `op.SkipStep(reason)` | `raise op.SkipStep(...)` | Skip this step and continue | step `skipped` |
+| Any other exception | `raise SomeError(...)` | Failure | step `failed`, migration `failed` |
 
-#### 9.14.3 SQL セッション
+`PauseStep` and `SkipStep` are *raised*, not returned. Returning a `PauseStep` / `SkipStep` instance has no special meaning and will be treated as a truthy return (i.e. `done`).
 
-- `conn` は引数で渡される（sync: SQLAlchemy `Connection`、async: `AsyncConnection`）
-- 自分で engine を作りたい場合は `op.get_engine()` でアクセス可能（同じ DB 接続情報）
-- transaction 制御は migration の `transaction_mode` に従う。step 内で明示的に transaction を切りたければ:
+#### 13.2.3 SQL session
+
+- `conn` is passed in (sync: SQLAlchemy `Connection`; async: `AsyncConnection`).
+- If you need your own engine, `op.get_engine()` exposes the same connection info.
+- Transaction control follows the migration's `transaction_mode`. To open an explicit transaction inside a step:
   - sync step: `with conn.begin():`
-  - async step: `async with conn.begin():`（`AsyncConnection` は async context manager のみサポート。sync 構文は `TypeError` になる）
+  - async step: `async with conn.begin():` (`AsyncConnection` only supports the async context manager; the sync form raises `TypeError`).
 
-#### 9.14.4 通常の op との違い
+#### 13.2.4 Difference from regular ops
 
-| 項目 | 通常 op (`add_column` 等) | `op.step` |
+| Aspect | Regular op (`add_column`, …) | `op.step` |
 |---|---|---|
-| 静的解析対象 (`joryu verify`) | ◯ | ×（黒箱扱い、`run_python` と同じ） |
-| 自動 schema 影響反映 | ◯ | ×（`op.declare_schema_change` で明示） |
-| ensure semantics | ◯ | 関数内でユーザ実装 |
-| 完了判定 | 例外なく終わったら done | 返り値で制御 |
-| `PauseStep` 対応 | × | ◯ |
+| Static analysis (`joryu verify`) | yes | no (opaque, same as `run_python`) |
+| Auto schema-impact recording | yes | no (use `op.declare_schema_change`) |
+| Ensure semantics | yes | user-implemented |
+| Completion criterion | non-exceptional return ⇒ done | controlled by return value |
+| `PauseStep` support | no | yes |
 
-### 9.15 Checkpoint API 詳細仕様
+### 13.3 Checkpoint API reference
 
-#### 9.15.1 メソッド
+#### 13.3.1 Methods
 
 ```python
-checkpoint.get(key, default=None)         # 値取得（None safe）
-checkpoint.set(key, value)                # 単一 key 更新（atomic UPDATE + commit）
-checkpoint.update({k1: v1, k2: v2})       # 複数 key を 1 UPDATE で atomic 更新
-checkpoint.clear()                        # progress 全消去（再開時に最初から）
-checkpoint.snapshot()                     # 現在の dict 全体（read-only コピー）
+checkpoint.get(key, default=None)         # fetch (None-safe)
+checkpoint.set(key, value)                # single-key update (atomic UPDATE + commit)
+checkpoint.update({k1: v1, k2: v2})       # multi-key atomic update in one UPDATE
+checkpoint.clear()                        # erase all progress (restart from scratch)
+checkpoint.snapshot()                     # read-only dict of the full state
 ```
 
-#### 9.15.2 永続化
+#### 13.3.2 Persistence
 
-- `joryu_migration_steps.progress` 列に **JSON テキスト** として保存
-- `set` / `update` は内部で `BEGIN; UPDATE joryu_migration_steps SET progress=... WHERE ...; COMMIT;`
-- 並行プロセスは advisory lock (§9.7) で排除されるので single writer
+- Stored as JSON text in `joryu_migration_steps.progress`.
+- `set` / `update` internally run `BEGIN; UPDATE joryu_migration_steps SET progress=... WHERE ...; COMMIT;`.
+- Concurrent writers are prevented by the advisory lock (§9.7) — single-writer guarantee.
 
-#### 9.15.3 Transaction 関係
+#### 13.3.3 Transaction relationship
 
-`set` / `update` はユーザの直前の DML と **同一 transaction で commit**:
+`set` / `update` commit in the *same* transaction as the user's immediately preceding DML:
 ```python
-conn.execute(UPDATE users SET ...)        # ユーザ DML
-checkpoint.set("cursor", x)               # ← この時点で COMMIT
+conn.execute(UPDATE users SET ...)        # user DML
+checkpoint.set("cursor", x)               # ← COMMIT happens here
 ```
-これにより「DML は走ったが checkpoint 未保存で重複処理」事故を防ぐ。
+This prevents "DML ran but checkpoint missed, so re-run double-processes."
 
-`transaction_mode = "none"` の場合はユーザが自分で transaction 制御:
+When `transaction_mode = "none"`, the user manages transactions:
 ```python
 with conn.begin():
     conn.execute(UPDATE...)
-    checkpoint.set("cursor", x)            # with 抜けで commit
+    checkpoint.set("cursor", x)            # commit at with-exit
 ```
 
-#### 9.15.4 シリアライズ可能型
+#### 13.3.4 Serializable types
 
-JSON 互換のみ:
+JSON-compatible types only:
 - `str`, `int`, `float`, `bool`, `list`, `dict`, `None`
-- `datetime` / `date` は `isoformat()` 文字列に自動変換
-- `Decimal` は文字列化
-- それ以外（カスタムオブジェクト等）は ERROR
+- `datetime` / `date` → `isoformat()` string (automatic).
+- `Decimal` → string (automatic).
+- Anything else (custom objects, etc.) is an ERROR.
 
-カスタム encoder/decoder hook (`migration.checkpoint_codec`) は v1.1+ で検討。
+A custom encoder/decoder hook (`migration.checkpoint_codec`) may be considered in v1.1+.
 
-#### 9.15.5 サイズと運用
+#### 13.3.5 Size and operations
 
-- soft limit: 1 MB／step。超えたら warn
-- 大量データを保持したいケースは専用テーブルを作る方が筋が良い（cursor のような「次に処理すべき位置」だけを checkpoint に置くべき）
-- 読込は初回 `get` で lazy load、以降はメモリキャッシュ
+- Soft limit: 1 MB per step. Exceeding it warns.
+- For large data, use a dedicated table. The checkpoint should hold only "next position to process" markers (cursors), not bulk data.
+- First `get` lazy-loads; subsequent reads are memory-cached.
 
-### 9.16 中途半端な失敗時のインタラクティブ復旧
+---
 
-step 2 が `run_python` で 50% 完了 → step 3 で ERROR、のような中途半端な状態では、`joryu apply --resume` で再実行する際に **ユーザに方針を尋ねる**:
+## 14. Progress display
 
-```
-$ joryu apply
-Migration 20260620T030000_backfill_email_normalized is in failed state.
+> When a migration is running, it must be visible what is happening: is it stuck, advancing, on which op?
+> joryu enumerates every step before executing any op (`upgrade()` is split into a registration phase and an execution phase), so step number, current op, next op, and progress can be displayed in real time.
 
-  ✓ step 1 add_column(users.email_normalized)  done
-  ⚠ step 2 run_python(backfill)                done at last_id=15003421 (30%)
-  ✗ step 3 alter_column(... NOT NULL)          failed: NotNullViolation
+### 14.1 The two-phase execution model
 
-How would you like to proceed?
-  [1] Resume from step 3 (re-run only failed/pending steps)
-  [2] Restart from step 2 (re-run from a chosen step)  ← prompt for step number
-  [3] Restart from step 1 (full restart, clears all checkpoints)
-  [4] Skip step 3 and continue (mark as skipped)
-  [5] Abort (do nothing)
+1. **Registration phase**: call `upgrade()` once to register all `op.*` calls in the registry (no real DB access). Step count, op kinds, and arguments are determined.
+2. **Execution phase**: execute registered steps in order. Each step emits start / done / progress events.
 
-Choose [1-5]:
-```
+This allows displaying "5 steps total" up front and rendering accurate progress bars.
 
-- デフォルトは `[1]` (resume)
-- `--non-interactive --on-failure=resume|restart|abort` で CI/自動化で挙動指定可能
-- `[3]` 全消去はチェックポイントを破棄、ensure semantics の op は再実行で skip されるが run_python は最初から走る → ユーザの WHERE 句が冪等であれば安全
-- `[4]` skip はメタ情報として記録され、後で `joryu status` で見える
+**`op.dialect` during the registration phase**:
+- Registration does not hold a real connection; `op.dialect` behaves as a read-only value carrying the target dialect name (`postgresql` / `mysql` / `sqlite`). This means `if op.dialect.name == "postgresql":` branching evaluates correctly during registration.
+- Only the dialect name from connection info is available. Real-query operations such as `conn.execute(...)` raise `RuntimeError` during registration (real DB access is confined to the execution phase).
+- The bodies of `op.run_python` / `op.step` are *not* called during registration (only the function objects are appended to the registry). So if a `run_python` / `op.step` body branches on dialect, the step count is fixed but the internal op count is not known up front. This is reflected in `describe()` output (e.g., "run_python: backfill (internal progress unavailable until execution)").
+- Writing side effects (external API calls, file I/O) into the body of `upgrade()` would execute them during registration. This is forbidden and detected statically by `joryu verify` (§7).
 
-### 9.17 リアルタイム進捗表示
+### 14.2 Display modes
 
-> Migration 実行中に何が起きているかが見えないと「止まっている / 進んでいる / どの op か」が分からない。
-> joryu は **op を実行する前に全 step を列挙** できるので（`upgrade()` の registration phase → execution phase に分離）、step 番号・現在の op・次の op・進捗をリアルタイムに出せる。
-
-#### 9.17.1 実行 phase の二段構え
-
-1. **Registration phase**: `upgrade()` を一度実行して `op.*` 呼び出しを registry に登録（実 DB には触れない）。step 数・op 種類・引数が確定
-2. **Execution phase**: 登録された step を順に実行。各 step の start/done/progress イベントを発火
-
-これにより事前に「全 5 step」と表示でき、進捗バーが正確になる。
-
-**Registration phase での `op.dialect`**:
-- registration では実 connection を握らず、`op.dialect` は接続対象の dialect 名 (`postgresql` / `mysql` / `sqlite`) を返す read-only な値として振る舞う。これにより `if op.dialect.name == "postgresql":` の分岐が registration でも正しく評価される。
-- 接続情報からの dialect 名のみが利用可能。`conn.execute(...)` 等の実クエリは registration phase では `RuntimeError` を投げる（実 DB アクセスは execution phase に限定）。
-- ただし `op.run_python` / `op.step` の本体は registration では呼ばれない（関数オブジェクトを registry に積むだけ）。そのため `run_python` / `op.step` の中身に dialect 分岐がある場合、step 単位の数は確定するが内部の op 数は事前に出せない。`describe()` 出力にもこの旨が反映される（「run_python: backfill（内部進捗は実行時）」）。
-- `upgrade()` 本体に副作用（外部 API 呼び出しやファイル IO）を書くと registration 時にも実行される。これは禁止し、`joryu verify` で静的に検知する（§7）。
-
-#### 9.17.2 表示モード
-
-| モード | トリガ | 出力 |
+| Mode | Trigger | Output |
 |---|---|---|
-| **auto** (既定) | フラグ無し。TTY なら interactive、それ以外は plain に自動切替 | 環境依存 |
-| **interactive** | `--interactive` または auto + TTY | rich-style の live progress（step バー + 現在/次の op） |
-| **plain** | `--plain` または auto + 非 TTY | 1 行 1 イベントの行指向ログ |
-| **json** | `--json` | JSONL 構造化ログ（外部監視向け） |
-| **quiet** | `--quiet` | 失敗時のみ |
+| **auto** (default) | No flag. Auto-selects interactive on TTY, plain otherwise | Environment-dependent |
+| **interactive** | `--interactive` or auto + TTY | Rich-style live progress (step bar + current/next op) |
+| **plain** | `--plain` or auto + non-TTY | Line-oriented log, one event per line |
+| **json** | `--json` | JSONL structured log (external monitoring) |
+| **quiet** | `--quiet` | Only on failure |
 
-CLI フラグは排他的 (`--interactive` / `--plain` / `--json` / `--quiet` は最大 1 つ指定可能)。同時指定は ERROR。指定なしは `auto`。
+CLI flags are mutually exclusive (`--interactive` / `--plain` / `--json` / `--quiet` — at most one). Combining them is ERROR. Without a flag, `auto` is used.
 
-**スコープ**: 進捗フラグを受け付けるのは長時間出力を行う `joryu apply` / `joryu test` / `joryu import alembic` の 3 つ。その他のサブコマンド (`status` / `show` / `verify` 等) は短時間で結果を返すため進捗フラグを受け付けない（指定すると ERROR）。`--json` のみは全コマンドで受理し、結果を JSONL で出力する（外部監視向け）。
+**Scope**: the progress flags are accepted by the three long-running subcommands `joryu apply`, `joryu test`, and `joryu import alembic`. Other subcommands (`status`, `show`, `verify`, etc.) return quickly and do not accept these flags (passing one is ERROR). Only `--json` is accepted by every command and emits results as JSONL (for external monitoring).
 
-**`--interactive` と `--non-interactive` の関係**: この 2 つは直交した別系統の制御である。
-- `--interactive` / `--plain` / `--json` / `--quiet` は **進捗表示モード** を制御する (§9.17.2)
-- `--non-interactive` は **失敗時の対話プロンプト** を抑制する (§9.16) — 進捗表示には影響しない
-- 同時指定は許可される (例: `joryu apply --non-interactive --interactive` は「CI モードだが rich progress を出す」という妥当な組み合わせ)
+**Relationship between `--interactive` and `--non-interactive`**: these are orthogonal controls.
+- `--interactive` / `--plain` / `--json` / `--quiet` control the **progress display mode** (§14.2).
+- `--non-interactive` suppresses the **failure-recovery prompt** (§10.5); it has no effect on progress display.
+- Combining them is allowed (e.g., `joryu apply --non-interactive --interactive` means "CI mode, but render rich progress" — a valid combination).
 
-#### 9.17.3 表示例
+### 14.3 Display examples
 
 **Interactive (TTY)**:
 ```
@@ -1290,18 +1330,18 @@ joryu apply
 {"event":"migration_done","id":"...","duration_ms":237500}
 ```
 
-#### 9.17.4 進捗報告 API
+### 14.4 Progress reporting API
 
-各 op には `describe() -> str` メソッドがあり、1 行説明を返す（autogenerated for built-in ops, customizable for `op.step`）。
+Every op has a `describe() -> str` method returning a one-line description (auto-generated for built-in ops, customizable for `op.step`).
 
-`run_python` / `op.step` 内では明示的に進捗を報告できる:
+Inside `run_python` / `op.step`, progress can be reported explicitly:
 
 ```python
 @op.step
 def backfill(conn, dialect, checkpoint):
     batch_size = 5_000
-    # total は最初の 1 回だけ確定して checkpoint に保存。
-    # 再開時に WHERE が処理済み行を除外して COUNT が縮むのを防ぐ。
+    # Fix `total` only on first run and persist it in checkpoint.
+    # Prevents shrinkage on resume when the WHERE filters out processed rows.
     total = checkpoint.get("total")
     if total is None:
         total = conn.execute(text("SELECT COUNT(*) FROM users WHERE ...")).scalar()
@@ -1310,7 +1350,7 @@ def backfill(conn, dialect, checkpoint):
     cursor = checkpoint.get("last_id", 0)
     while done < total:
         # ... batch work that advances `cursor` and processes up to batch_size rows.
-        # 処理した行数を実測して done に加算（最終 batch では batch_size より少ないことに注意）
+        # Measure the actual rows processed and add to done (the last batch may be smaller).
         processed = run_one_batch(conn, cursor, batch_size)  # returns (new_cursor, rows_done)
         cursor, rows_done = processed
         done += rows_done
@@ -1318,148 +1358,150 @@ def backfill(conn, dialect, checkpoint):
         checkpoint.report(percent=done * 100 // total,
                           message=f"processed {done}/{total}")
         if rows_done == 0:
-            break  # 安全網: もう処理対象が無い
+            break  # safety net: no rows left to process
     return True
 ```
 
-`checkpoint.report(...)` の挙動:
-- TTY モード: 進捗バーを更新（rate limit: 100ms ごとに 1 回まで）
-- Plain モード: 1 秒ごとに 1 回ログ出力
-- JSON モード: `step_progress` イベントを発火
-- 値は永続化されない（一過性の表示用）。永続化したいなら `checkpoint.set(...)` を併用
+`checkpoint.report(...)` behavior:
+- TTY mode: refresh the progress bar (rate-limited to at most once per 100 ms).
+- Plain mode: emit a log line at most once per second.
+- JSON mode: emit a `step_progress` event.
+- The value is not persisted (display-only). To persist, also call `checkpoint.set(...)`.
 
-`op.step` のカスタム description:
+Custom description for `op.step`:
 ```python
 @op.step(description="wait for replication lag < 1s")
 def wait_for_replication(conn, dialect, checkpoint):
     ...
 ```
 
-### 9.18 本番判定とローカル安全策
+---
 
-`joryu down` のような破壊的コマンドを誤って本番で実行しないための判定方針:
+## 15. Production safety
 
-#### 9.18.1 自動判定 (heuristic)
+Policy for avoiding accidental destructive commands (like `joryu down`) on production:
 
-DB 接続文字列に以下のいずれかを含むなら **ローカル**と推定:
+### 15.1 Heuristic detection
+
+The DB connection string is treated as **local** when any of the following hold:
 - `localhost` / `127.0.0.1` / `::1`
-- ホスト名に `.local` / `local-` / `-local` を含む
-- ファイルパス（SQLite）
+- Hostname contains `.local`, `local-`, or `-local`.
+- A file path (SQLite).
 - `host.docker.internal`
-- 環境変数 `JORYU_ENV` が `local` / `dev` / `test`
+- Environment variable `JORYU_ENV` is `local` / `dev` / `test`.
 
-それ以外は **production-like** と判定し、`joryu down` は `--allow-prod` 必須。
+Otherwise the connection is treated as **production-like** and `joryu down` requires `--allow-prod`.
 
-#### 9.18.2 明示宣言
+### 15.2 Explicit declaration
 
-設定ファイルや init API で本番宣言:
+Declare via a config file or init API:
 ```python
 import joryu
-joryu.set_environment("production")    # 明示宣言、heuristic を上書き
+joryu.set_environment("production")    # explicit; overrides heuristics
 ```
-または `joryu.toml`:
+Or in `joryu.toml`:
 ```toml
 [joryu]
 environment = "production"            # local / staging / production
 ```
 
-`environment != "local"` のとき:
-- `joryu down`: `--allow-prod` 必須
-- `joryu apply`: `--continue-past-failed` がより慎重なプロンプトを出す
-- `joryu mark`: 確認プロンプト
+When `environment != "local"`:
+- `joryu down`: `--allow-prod` is required.
+- `joryu apply`: `--continue-past-failed` shows a stricter confirmation prompt.
+- `joryu mark`: confirmation prompt.
 
-#### 9.18.3 ドキュメント方針
+### 15.3 Documentation
 
-manual に「本番環境の判定方法」専用セクションを置き、heuristic の限界、明示宣言の推奨、CI/CD への組み込み方を網羅する。誤判定が事故にも利便性低下にもなるため、判定の透明性が重要。
+A dedicated section in the manual covers production detection: the limits of the heuristic, the recommendation to declare explicitly, and CI/CD integration. Transparent detection is essential because both false positives and false negatives are harmful.
 
 ---
 
-## 10. CLI
+## 16. CLI
 
 ```
-joryu init                              # 初期セットアップ
+joryu init                              # initial setup
 joryu generate <slug> [--empty] [--against=db|replay]
 joryu apply [--target=<id>] [--dry-run] [--no-resume] [--continue-past-failed]
                                         #   [--non-interactive --on-failure=resume|restart|abort]
                                         #   [--retry-paused --retry-interval=30s]
-                                        #   [--interactive | --plain | --json | --quiet]  # 進捗表示モード (§9.17、既定 auto)
-joryu status                            # 適用済み/未適用/失敗/paused 一覧、step 進捗付き
-joryu down [--steps=N | --to=<id>] [--allow-prod]   # dev 専用、production-like 接続は明示許可必須
-joryu schema-snapshot [--format=json|sql]           # AI 補助用に現在 schema を出力
-joryu verify                            # CI 向け：改変検知 + 意味的競合検知 (§7)
-joryu repair <id>                       # 適用済み migration の checksum を更新
-joryu mark <id> --as=applied|pending|failed       # 手動状態修正（最後の手段）
-joryu mark <id>.<step> --as=done|pending|skipped  # 個別 step の状態修正
-joryu show <id>                         # 詳細表示
-joryu explain <id>                      # 自然言語化（AI 補助）
+                                        #   [--interactive | --plain | --json | --quiet]  # progress mode (§14, default auto)
+joryu status                            # list applied / pending / failed / paused, with step progress
+joryu down [--steps=N | --to=<id>] [--allow-prod]   # dev-only; production-like connections require explicit allow
+joryu schema-snapshot [--format=json|sql]           # emit the current schema for AI assistance
+joryu verify                            # CI: mutation detection + semantic conflict detection (§7)
+joryu repair <id>                       # update the checksum of an applied migration
+joryu mark <id> --as=applied|pending|failed       # manual state correction (last resort)
+joryu mark <id>.<step> --as=done|pending|skipped  # correct an individual step
+joryu show <id>                         # show details
+joryu explain <id>                      # natural-language rendering (AI assistance)
 joryu test [--unit | --integration] [--dialects=postgresql,mysql,sqlite]
 joryu import alembic --alembic-dir=./alembic --output-dir=./migrations
                                         #   [--migrate-state] [--drop-alembic-table] [--report]
 ```
 
-### 10.1 Python API エントリポイント
+### 16.1 Python API entry points
 
-CLI と等価な Python API を v1 で提供する。test harness、デプロイスクリプト、async web framework からの組み込み用途。
+A Python API equivalent to the CLI is shipped in v1. Use cases: test harnesses, deploy scripts, and embedding in async web frameworks.
 
 ```python
 import joryu
 
-# 同期 API（CLI と等価。内部で anyio.run を起動）
+# Sync API (equivalent to the CLI; internally uses anyio.run)
 joryu.apply(target=None, dry_run=False, no_resume=False, continue_past_failed=False,
             non_interactive=False, on_failure="resume",
             retry_paused=False, retry_interval="30s",
-            output="auto")      # "auto" | "interactive" | "plain" | "json" | "quiet" — 詳細は §9.17.2
+            output="auto")      # "auto" | "interactive" | "plain" | "json" | "quiet" — see §14.2
 joryu.status()
 joryu.down(steps=None, to=None, allow_prod=False)
 joryu.verify()
 joryu.generate(slug, empty=False, against="db")
 
-# Async API（呼び出し側が既にイベントループ上にいる場合）
-await joryu.apply_async(...)    # 上記 apply と同シグネチャ、`await` 必須
-await joryu.down_async(steps=None, to=None, allow_prod=False)  # 上記 down と同シグネチャ
+# Async API (when the caller is already on an event loop)
+await joryu.apply_async(...)    # same signature as apply, requires await
+await joryu.down_async(steps=None, to=None, allow_prod=False)  # same signature as down
 ```
 
-- 同期 API は `anyio.run(...)` で内部ループを起動する。既存ループ上から呼ぶと `RuntimeError`。
-- async API は呼び出し側ループを再利用し、async step を直接 `await` する。
-- どちらも CLI と同じ exit code 規約 (§10.2) に従い、失敗は §10.3 の例外で通知する。
+- The sync API starts its own loop via `anyio.run(...)`. Calling it from an existing loop raises `RuntimeError`.
+- The async API reuses the caller's loop and `await`s steps directly.
+- Both follow the same exit-code convention as the CLI (§16.2) and signal failure through the exceptions in §16.3.
 
-### 10.2 Exit code
+### 16.2 Exit codes
 
-CLI / API 共通の終了ステータス:
+Shared by CLI and API:
 
-| code | 意味 | 対応例外 (Python API) |
+| Code | Meaning | Corresponding exception (Python API) |
 |---|---|---|
-| `0` | 成功 | — |
-| `1` | 一般エラー（unexpected exception、引数誤り等） | `JoryuError` (base) |
-| `2` | Migration 失敗（apply 中に step がエラー終了） | `MigrationFailed` |
-| `3` | Migration 一時停止（`PauseStep` 発火、または `--retry-paused` でも復帰せず、または既存 paused migration に阻まれて halt） | `MigrationPaused` |
-| `4` | Verify 失敗（drift / 競合検出） | `VerificationFailed` |
-| `5` | Production guard により拒否（`--allow-prod` 未指定で本番判定された） | `ProductionGuardError` |
+| `0` | Success | — |
+| `1` | General error (unexpected exception, argument errors, etc.) | `JoryuError` (base) |
+| `2` | Migration failure (a step errored during apply) | `MigrationFailed` |
+| `3` | Migration paused (`PauseStep` raised, or still paused after `--retry-paused`, or halted by an existing paused migration) | `MigrationPaused` |
+| `4` | Verify failure (drift / conflict detected) | `VerificationFailed` |
+| `5` | Rejected by production guard (production detected, `--allow-prod` not passed) | `ProductionGuardError` |
 
-### 10.3 公開例外クラス
+### 16.3 Public exception classes
 
-`joryu` パッケージから直接 import 可能な例外:
+Importable directly from the `joryu` package:
 
 ```python
-joryu.JoryuError                     # 全例外の基底
+joryu.JoryuError                     # base of every exception
 ├── MigrationFailed(migration_id, step_index, step_name, cause)
 ├── MigrationPaused(migration_id, step_index, step_name, reason)
 ├── VerificationFailed(conflicts: list[Conflict])
 └── ProductionGuardError(detected_env: Literal["staging", "production", "production-like"], host: str | None)
 ```
 
-- `MigrationFailed.cause` には元の例外を保持（chain 経由ではなく属性で参照可能）
-- `MigrationPaused` は `PauseStep` が `op.step` または `op.run_python` から送出された場合に top-level で raise される（§9.14.2 のステップレベル signal と対）
-- `VerificationFailed.conflicts` は §7 の Conflict オブジェクトのリスト
+- `MigrationFailed.cause` holds the original exception as an attribute (not just via exception chaining).
+- `MigrationPaused` is raised at the top level when `PauseStep` is *raised* from inside `op.step` or `op.run_python` (paired with the step-level signal in §13.2.2; `PauseStep` is never returned, only raised).
+- `VerificationFailed.conflicts` is a list of Conflict objects (see §7).
 - `ProductionGuardError.detected_env`:
-  - 明示宣言があった場合 (§9.18.2 の `joryu.set_environment(...)` または `joryu.toml`) はその文字列 (`"staging"` / `"production"`)
-  - heuristic で本番判定された場合は `"production-like"`（local 判定は false なので例外を投げない）
-  - `host` は接続文字列から抽出したホスト名（SQLite ファイルパス等で取得できないときは `None`）
-- いずれも `str(exc)` で人間可読な要約を返す
+  - If declared explicitly (§15.2 `joryu.set_environment(...)` or `joryu.toml`), the declared string (`"staging"` / `"production"`).
+  - If detected heuristically as production-like, `"production-like"` (local detection does not raise).
+  - `host` is the hostname extracted from the connection string (or `None` when not extractable, e.g., a SQLite file path).
+- Every exception returns a human-readable summary from `str(exc)`.
 
 ---
 
-## 11. 設定ファイル `joryu.toml`
+## 17. Configuration file (`joryu.toml`)
 
 ```toml
 [joryu]
@@ -1476,133 +1518,123 @@ include_schemas = ["public"]
 exclude_tables  = ["spatial_ref_sys"]
 
 [dialects]
-# 開発時にテストしたい方言一覧（joryu test のデフォルト）
+# Dialects to exercise during development (joryu test default).
 test_targets = ["postgresql", "mysql", "sqlite"]
 ```
 
 ---
 
-## 12. Alembic / Django との比較
+## 18. Comparison with Alembic and Django
 
-| 項目 | Alembic | Django | joryu |
+| Item | Alembic | Django | joryu |
 |---|---|---|---|
-| 主役言語 | Python | Python | Python |
-| マイグレーション ID | random hex | per-app sequence | UTC timestamp |
-| 順序モデル | linked-list (`down_revision`) | per-app sequence + cross-app deps | DAG (`depends_on` set) |
-| 並走 PR | `alembic merge` 儀式必要 | 番号衝突 → `makemigrations --merge` | 独立変更は merge OK、同オブジェクト変更のみ `joryu verify` で検知 |
-| 自動生成 | DB 必須 | アプリのモデルから | モデルから (DB なしも可) |
-| 履歴リプレイ | 不可（op 命令型） | 可（Operations 宣言的） | 可（Operations 宣言的） |
-| データ移行 | 同居可 | `RunPython` で同居 | `op.run_python` で同居 |
-| 多方言 | 手書きで分岐 | Django ORM 経由で限定的に吸収 | 三層モデルで明示支援 |
-| escape hatch | `op.execute(text(...))` | `RunSQL("...")` | `op.execute("..."|dict)` 一級市民 |
-| 整合性検証 | なし | なし | `joryu verify`（DB checksum + Operations 静的解析）|
-| forward-only | 思想なし | 実質そう | 明文化 |
-| **op の意味論** | 命令的（既存ありで死ぬ） | 命令的 | **Ensure-style（冪等）** |
-| **中断・再開** | 不可（手で DB 戻して再実行） | 同じ | **step 単位 resume、batched op は cursor 保存** |
-| **transaction** | 1 migration = 1 tx 固定 | DB 任せ | `per_migration` / `per_step` (default) / `none` |
-| **大量データ更新** | 自分で書く（resume なし） | 自分で書く（resume なし） | ユーザが書いた loop に **checkpoint API** で resume 機能だけ提供 |
+| Primary language | Python | Python | Python |
+| Migration ID | random hex | per-app sequence | UTC timestamp |
+| Ordering model | linked list (`down_revision`) | per-app sequence + cross-app deps | DAG (`depends_on` set) |
+| Parallel PRs | requires `alembic merge` ceremony | numbering collisions → `makemigrations --merge` | independent changes merge freely; same-object changes caught by `joryu verify` |
+| Autogeneration | DB required | from app models | from models (DB optional) |
+| History replay | impossible (imperative ops) | possible (declarative Operations) | possible (declarative Operations) |
+| Data migration | colocated | colocated via `RunPython` | colocated via `op.run_python` |
+| Multi-dialect | hand-written branching | partial absorption via Django ORM | explicit three-layer model |
+| Escape hatch | `op.execute(text(...))` | `RunSQL("...")` | `op.execute("..." \| dict)` first-class |
+| Consistency check | none | none | `joryu verify` (DB checksum + Operations static analysis) |
+| Forward-only | not designed | de facto | explicit |
+| **Op semantics** | imperative (dies if it exists) | imperative | **Ensure-style (idempotent)** |
+| **Interrupt / resume** | not supported (rollback by hand, then rerun) | same | **per-step resume; batched ops use checkpoints** |
+| **Transactions** | 1 migration = 1 tx (fixed) | DB-dependent | `per_migration` / `per_step` (default) / `none` |
+| **Bulk data updates** | hand-written (no resume) | hand-written (no resume) | user writes the loop; library provides a checkpoint API for resume |
 
 ---
 
-## 13. Alembic からの移行ツール
+## 19. Alembic migration tool
 
-> joryu は **v1 リリース時から Alembic 移行ツール (`joryu import alembic`) を提供** する。
-> 既存 Alembic ユーザを獲得するため、移行コストを最小化する。
+> joryu ships the Alembic migration tool (`joryu import alembic`) from the v1 release to minimize switching cost for existing Alembic users.
 
-### 13.1 アプローチ
+### 19.1 Approach
 
 ```
 joryu import alembic --alembic-dir=./alembic --output-dir=./migrations
 ```
 
-#### Phase 1: 構造変換（自動）
-- `versions/*.py` を全スキャン
-- `revision` / `down_revision` の linked-list を `depends_on` の DAG に変換
-- ファイル名を `<timestamp>_<slug>.py` に正規化（ランダム hex → timestamp に推定変換、`alembic history` を解析して順序を推測 + 元の hex を `tags` に保持）
-- `op.add_column(..., sa.Column(name, type, ...))` → `op.add_column(..., name, type, ...)` への引数構造変換
-- `op.execute(text("..."))` → `op.execute("...")`
-- `upgrade()` / `downgrade()` を `@joryu.migration` / `@joryu.downgrade` でラップ
+#### Phase 1: structural conversion (automatic)
+- Scan all `versions/*.py`.
+- Convert the `revision` / `down_revision` linked list into a `depends_on` DAG.
+- Normalize filenames to `<timestamp>_<slug>.py` (random hex → inferred timestamp by parsing `alembic history`; the original hex is preserved in `tags`).
+- Rewrite `op.add_column(..., sa.Column(name, type, ...))` → `op.add_column(..., name, type, ...)`.
+- Rewrite `op.execute(text("..."))` → `op.execute("...")`.
+- Wrap `upgrade()` / `downgrade()` with `@joryu.migration` / `@joryu.downgrade`.
 
-#### Phase 2: ヒューリスティクス変換（半自動、確認プロンプト付き）
-- `op.batch_alter_table(...)` → `with op.batch(...)`
-- `if op.get_bind().dialect.name == ...` → `op.execute({dialect: ...})` への書き換え提案
-- `op.execute("CONCURRENTLY ...")` を検出 → `transaction_mode="none"` の付与提案
-- データ移行 (`op.execute("UPDATE ...")` の長い形) → `op.run_python` への抽出提案
+#### Phase 2: heuristic conversion (semi-automatic, with confirmation prompts)
+- `op.batch_alter_table(...)` → `with op.batch(...)`.
+- `if op.get_bind().dialect.name == ...` → suggested rewrite to `op.execute({dialect: ...})`.
+- Detect `op.execute("CONCURRENTLY ...")` and suggest `transaction_mode="none"`.
+- Long-form data migrations (`op.execute("UPDATE ...")`) → suggest extracting into `op.run_python`.
 
-#### Phase 3: 手動レビュー領域（コメントで残す）
-- 元コードに残ったまま `# JORYU-IMPORT-TODO: ...` コメントを付与
-- `joryu import alembic --report` で全 TODO 一覧を出力
-- `op.create_table` 内の方言固有 kwarg (`postgresql_using=`, `mysql_engine=`) は元のまま保持し、joryu 側で互換 wrapper を提供
+#### Phase 3: manual-review residue (left as comments)
+- Code that cannot be auto-converted is left as-is with a `# JORYU-IMPORT-TODO: ...` comment.
+- `joryu import alembic --report` produces a TODO listing.
+- Dialect-specific kwargs inside `op.create_table` (`postgresql_using=`, `mysql_engine=`) are preserved as-is; joryu provides compat wrappers.
 
-### 13.2 状態テーブルの引き継ぎ
+### 19.2 State table handover
 
 ```
 joryu import alembic --migrate-state
 ```
 
-- 既存 `alembic_version` テーブルから現在 revision を読み取り
-- 変換後の `joryu_migrations` に、対応する全 migration id を「適用済み」として INSERT
-- `alembic_version` テーブルは保持（ロールバック用）。`joryu import alembic --drop-alembic-table` で明示削除
+- Read the current revision from the existing `alembic_version` table.
+- INSERT into the new `joryu_migrations` all corresponding migration IDs as "applied."
+- The `alembic_version` table is preserved (for rollback). Drop it explicitly with `joryu import alembic --drop-alembic-table`.
 
-### 13.3 並走運用 (gradual migration)
+### 19.3 Side-by-side operation (gradual migration)
 
-「Alembic と joryu を一定期間並走させたい」というニーズに対応:
-- `joryu apply` は `alembic_version` を読まない（独立）
-- 移行期は両方の CLI を順番に実行する想定
-- 推奨フロー: import → 全 PR で Alembic 凍結 → joryu のみで運用開始 → `alembic_version` テーブル削除
+Supports a transition period where Alembic and joryu run side by side:
+- `joryu apply` does not read `alembic_version` (independent).
+- During the transition, run both CLIs in sequence.
+- Recommended flow: import → freeze Alembic on every PR → run joryu only → drop `alembic_version`.
 
-### 13.4 制約
+### 19.4 Constraints
 
-- `op.bulk_insert(...)` のような Alembic 固有 op は同等機能を提供しないので `op.run_python` への手動書き換え必須
-- branch labels や複数 head は単一 DAG に flatten される（merge revision は `depends_on` で複数親を持つ migration として表現）
-- カスタム migration template は変換対象外
-
----
-
-## 14. オープン課題
-
-### 解決済み（記録）
-
-- ✅ **migration の宣言スタイル**: `@joryu.migration(...)` デコレータ採用 (§3.2)
-- ✅ **`op.execute(dict)` のキー正規化**: `postgresql`/`mysql`/`mariadb`/`sqlite` を独立 key、`default` あり、文字列単体も可 (§6.1)
-- ✅ **`op.batch` の自動発動**: 明示要求とする。`generate` 時のコード生成では自動ラップ (§4.4)
-- ✅ **履歴リプレイの粒度**: Operations replay 主体、`run_python` / raw SQL は `op.declare_schema_change()` ヒント併記 (§9.13)
-- ✅ **複数方言の論理 group**: `group=` パラメータで束ねる (§6.1 Layer 3)
-- ✅ **生成 AI 直接モード**: 非搭載ポリシーを永続化、公式 skill を提供 (§1 非ゴール)
-- ✅ **Alembic 移行ツール**: v1 から提供 (§13)
-- ✅ **`joryu test` の実装**: unit (in-memory) + integration (testcontainers) の二層 (§6.4)
-- ✅ **中途半端な失敗の扱い**: インタラクティブな 5 択プロンプト (§9.16)
-- ✅ **本番判定**: heuristic + 明示宣言の二段構え (§9.18)
-- ✅ **checkpoint API 詳細**: §9.15 で完全仕様化
-- ✅ **op.step ユーザ定義 step**: §9.14 で仕様化
-
-### 残課題 (現時点なし — 全項目決着)
-
-### 後日まとめて対応
-- **SPEC.md の章立て整理 + 目次追加** → 英語化のタイミングで一斉に実施
-- **SPEC.md → English 翻訳** → 設計凍結後に全体を英訳、ルート CLAUDE.md の言語ポリシー (SPEC 例外) を解除
-
-### 解決済み（追加）
-
-- ✅ **Python バージョン**: 3.11+ (§1 動作環境)
-- ✅ **AI skill 配布**: repository 内 `.claude/skills/joryu/` 同梱 (§1 公式 AI skill 配布)
-- ✅ **`op.declare_schema_change` 語彙 v1 確定** (§9.13.2 末): column/table/index/constraint/extension/enum/view/materialized_view/trigger/policy/sequence/schema の add/drop/altered/renamed
-- ✅ **Alembic import エッジケース方針確定** (§13):
-  - branch labels: 無視（捨てる）
-  - 多 head: 並列 leaf として全取込
-  - merge revision: `depends_on` に複数親
-  - `bulk_insert`: `op.run_python` stub + TODO コメント
-  - カスタム template: warn でスキップ
-- ✅ **CI テンプレート**: GitHub Actions / GitLab CI / pre-commit の 3 種を `examples/ci/` に公式提供
-- ✅ **`op.step` async runtime**: **anyio** で抽象化 (§9.14.2)
-- ✅ **sync `op.step` を一級市民として明示** (§9.14.2): SQLAlchemy Core/ORM が想定最頻パターン
-- ✅ **リアルタイム進捗表示**: registration phase → execution phase の二段構え、TTY/plain/JSON モード、`checkpoint.report()` API (§9.17)
+- Alembic-specific ops like `op.bulk_insert(...)` have no direct equivalent; they must be rewritten as `op.run_python` by hand.
+- Branch labels and multiple heads collapse into a single DAG (merge revisions become migrations with multiple parents in `depends_on`).
+- Custom migration templates are not converted.
 
 ---
 
-## 付録 A: マイグレーション例
+## 20. Design decisions log
 
-### A.1 単純な DDL（方言自動）
+Resolved decisions (with section pointers):
+
+- [x] **Migration declaration style**: `@joryu.migration(...)` decorator (§3.2).
+- [x] **`op.execute(dict)` key normalization**: `postgresql` / `mysql` / `mariadb` / `sqlite` are independent keys; `default` exists; a bare string is also accepted (§6.1).
+- [x] **`op.batch` triggering**: explicit opt-in; `generate` auto-wraps code on SQLite targets (§4.4).
+- [x] **History replay granularity**: Operations replay as the primary mechanism; `run_python` / raw SQL annotated with `op.declare_schema_change()` (§12).
+- [x] **Logical group across dialects**: bind with the `group=` parameter (§6.1 Layer 3).
+- [x] **Direct generative-AI mode**: not shipping (permanent); ship an official skill instead (§1 non-goals).
+- [x] **Alembic migration tool**: shipped from v1 (§19).
+- [x] **`joryu test` implementation**: two tiers — unit (in-memory) + integration (testcontainers) (§6.4).
+- [x] **Half-failed state handling**: interactive 5-choice prompt (§10.5).
+- [x] **Production detection**: heuristic + explicit declaration (§15).
+- [x] **Checkpoint API**: fully specified in §13.3.
+- [x] **User-defined steps (`op.step`)**: specified in §13.2.
+- [x] **Python version**: 3.11+ (§1 runtime requirements).
+- [x] **AI skill distribution**: shipped in-repo at `.claude/skills/joryu/` (§1 official AI skill distribution).
+- [x] **`op.declare_schema_change` vocabulary frozen in v1** (§12.2, "v1 vocabulary" sub-table): all entities (column / table / index / constraint / extension / enum / view / materialized_view / trigger / policy / sequence / schema) support `add` and `drop`; `altered` is defined only for `column`; `renamed` is defined for `column` and `table`; `index_renamed` is intentionally omitted (raw SQL path).
+- [x] **Alembic import edge cases** (§19):
+  - branch labels: ignored (dropped),
+  - multiple heads: imported as parallel leaves,
+  - merge revisions: multiple parents in `depends_on`,
+  - `bulk_insert`: stubbed as `op.run_python` with a TODO comment,
+  - custom templates: skipped with a warning.
+- [x] **CI templates**: official GitHub Actions / GitLab CI / pre-commit templates under `examples/ci/`.
+- [x] **`op.step` async runtime**: abstracted via **anyio** (§13.2.2).
+- [x] **Sync `op.step` as a first-class case** (§13.2.2): SQLAlchemy Core/ORM is the expected dominant pattern.
+- [x] **Real-time progress display**: two-phase (registration → execution), TTY/plain/JSON modes, `checkpoint.report()` API (§14).
+
+---
+
+## Appendix A: Migration examples
+
+### A.1 Simple DDL (dialect-automatic)
 
 ```python
 """Add users table."""
@@ -1623,7 +1655,7 @@ def downgrade():
     op.drop_table("users")
 ```
 
-### A.2 データ移行を含む
+### A.2 Includes data migration
 
 ```python
 """Normalize emails and enforce NOT NULL."""
@@ -1645,7 +1677,7 @@ def upgrade():
     op.alter_column("users", "email_normalized", nullable=False)
 ```
 
-### A.3 方言別 SQL（Layer 2）
+### A.3 Per-dialect SQL (Layer 2)
 
 ```python
 """Add GIN index on settings JSON column."""
@@ -1654,7 +1686,7 @@ from joryu import op
 
 @joryu.migration(
     id="20260520T100000_settings_index",
-    transaction_mode="none",     # CREATE INDEX CONCURRENTLY を含むため
+    transaction_mode="none",     # uses CREATE INDEX CONCURRENTLY
 )
 def upgrade():
     op.execute({
@@ -1668,7 +1700,7 @@ def downgrade():
     op.execute("DROP INDEX users_settings_idx")
 ```
 
-### A.4 方言限定ファイル + group（Layer 3）
+### A.4 Dialect-restricted file + group (Layer 3)
 
 ```python
 """Postgres-only: enable pgcrypto and create RLS policy."""
@@ -1687,7 +1719,7 @@ def upgrade():
     op.execute("CREATE POLICY users_self ON users USING (id = current_setting('app.user_id')::bigint)")
 ```
 
-### A.5 SQLite 対応の制約変更（batch）
+### A.5 SQLite-compatible constraint change (batch)
 
 ```python
 """Make users.email NOT NULL."""
@@ -1698,11 +1730,11 @@ from joryu import op
 def upgrade():
     with op.batch("users") as batch:
         batch.alter_column("email", nullable=False)
-    # Postgres/MySQL: ALTER TABLE users ALTER COLUMN email SET NOT NULL
-    # SQLite: 新テーブル作成 → データコピー → rename
+    # Postgres / MySQL: ALTER TABLE users ALTER COLUMN email SET NOT NULL
+    # SQLite: create new table → copy data → rename
 ```
 
-### A.6 SQLAlchemy モデルから直接
+### A.6 Directly from a SQLAlchemy model
 
 ```python
 """Create orders table from model."""
@@ -1719,9 +1751,9 @@ def downgrade():
     op.drop_table("orders")
 ```
 
-### A.7 大量データ更新（resumable, ユーザ実装の batching loop）
+### A.7 Bulk update (resumable, user-written batching loop)
 
-数千万行への `UPDATE` を本番で安全に流す例。joryu は checkpoint インフラだけ提供、batching loop はユーザが書く。中断しても保存された cursor から再開できる。
+A safe production-grade UPDATE on tens of millions of rows. joryu provides only the checkpoint infrastructure; the user writes the loop. On interruption, resume from the saved cursor.
 
 ```python
 """Backfill users.email_normalized for 50M rows."""
@@ -1734,17 +1766,17 @@ BATCH_SIZE = 10_000
 @joryu.migration(
     id="20260620T030000_backfill_email_normalized",
     depends_on=["20260619T120000_add_email_normalized_col"],
-    transaction_mode="per_step",   # default だが明示
+    transaction_mode="per_step",   # default, but explicit
 )
 def upgrade():
-    # Step 1: ensure semantics — 既存なら skip
+    # Step 1: ensure semantics — skipped if already present.
     op.add_column("users", "email_normalized", t.Text, nullable=True)
 
-    # Step 2: 未処理行絞り込み用の partial index（処理後に drop）
+    # Step 2: partial index for narrowing unprocessed rows (drop after backfill).
     op.create_index("tmp_users_unnormalized", "users", ["id"],
                     where="email_normalized IS NULL")
 
-    # Step 3: ユーザが書いた batching loop。joryu は checkpoint を永続化
+    # Step 3: user-written batching loop; joryu persists the checkpoint.
     def backfill(conn, dialect, checkpoint):
         cursor = checkpoint.get("last_id", 0)
         while True:
@@ -1760,22 +1792,22 @@ def upgrade():
                 "WHERE id = ANY(:ids)"
             ), {"ids": [r.id for r in rows]})
             cursor = rows[-1].id
-            checkpoint.set("last_id", cursor)   # commit + 永続化
+            checkpoint.set("last_id", cursor)   # commit + persist
 
     op.run_python(backfill)
 
-    # Step 4: 一時 index 削除
+    # Step 4: drop the temporary index.
     op.drop_index("tmp_users_unnormalized")
 
-    # Step 5: 全行埋まったので NOT NULL 化
+    # Step 5: with every row populated, enforce NOT NULL.
     op.alter_column("users", "email_normalized", nullable=False)
 ```
 
-**中断・再開シナリオ**:
+**Interruption / resume scenario**:
 ```
 $ joryu apply
-→ Step 3 で 30% (15M/50M 行) 進んだところで OOM kill
-→ DB 状態: status='failed', steps[3].progress='{"last_id": 15003421}'
+→ step 3 reaches 30% (15M/50M rows) and is OOM-killed
+→ DB state: status='failed', steps[3].progress='{"last_id": 15003421}'
 
 $ joryu status
 20260620T030000_backfill_email_normalized  failed
@@ -1786,10 +1818,10 @@ $ joryu status
   · step 5 (alter_column)       pending
 
 $ joryu apply
-→ step 1, 2 skip、step 3 を last_id=15003421 から再開、step 4, 5 実行
+→ steps 1 and 2 skip; step 3 resumes from last_id=15003421; steps 4 and 5 execute
 ```
 
-### A.8 DDL 多段で途中失敗（最頻パターン）
+### A.8 Mid-failure on multi-stage DDL (common case)
 
 ```python
 """Add three columns and an index on col2."""
@@ -1804,13 +1836,13 @@ def upgrade():
     op.add_column("users", "col3", t.Text)
 ```
 
-**実行例 1: step 3 で失敗 → 原因除去 → 継続**
+**Run 1: step 3 fails → remove the cause → continue**
 
 ```
 $ joryu apply
-→ step 1, 2 完了 (col1, col2 追加)
-→ step 3 (CREATE INDEX idx_col2) 失敗: index 'idx_col2' already exists
-→ migration failed, step 4 未実行
+→ steps 1 and 2 complete (col1, col2 added)
+→ step 3 (CREATE INDEX idx_col2) fails: index 'idx_col2' already exists
+→ migration failed, step 4 not executed
 
 $ joryu status
 20260622T100000_add_columns_and_idx  failed
@@ -1819,25 +1851,25 @@ $ joryu status
   ✗ step 3 create_index(idx_col2)        ← failed
   · step 4 add_column(users.col3)        pending
 
-# 原因対処: 既存の idx_col2 を drop または rename
+# Fix: drop or rename the existing idx_col2.
 
 $ joryu apply
-→ step 1, 2 skip (ensure: 既存)
-→ step 3 retry → 成功
-→ step 4 実行 → 成功
+→ steps 1 and 2 skip (ensure: already present)
+→ step 3 retries → success
+→ step 4 runs → success
 → applied
 ```
 
-**実行例 2: 失敗を見てファイルを修正 → push**
+**Run 2: edit the file in response to the failure**
 
-index 名を `idx_users_col2` に変えてコミット。`joryu apply` 再実行：
+Rename the index to `idx_users_col2` and commit. Re-run `joryu apply`:
 
-- migration 状態が `failed` → checksum 変更を許可（§9.10）
-- step 1, 2 の fingerprint は不変 → skip
-- step 3 の fingerprint 変更 → 新内容 (`idx_users_col2`) で実行
-- step 4 実行 → 完了
+- Migration is `failed`, so a checksum change is allowed (§10.3).
+- Step 1 and 2 fingerprints unchanged → skip.
+- Step 3 fingerprint changes → execute with the new content (`idx_users_col2`).
+- Step 4 executes → done.
 
-### A.9 Ensure-style の挙動例
+### A.9 Ensure-style behavior example
 
 ```python
 """Add phone column — re-runnable safely."""
@@ -1846,13 +1878,13 @@ from joryu import op, types as t
 
 @joryu.migration(id="20260625T100000_add_phone")
 def upgrade():
-    # 1 回目: カラム追加
-    # 2 回目以降: 既に存在し型も一致 → skip（ensure semantics）
-    # もし手動で phone INTEGER で追加されていた → 型不一致 ERROR
+    # First run: column added.
+    # Subsequent runs: already exists with matching type → skip (ensure semantics).
+    # If someone manually added phone INTEGER, this errors on type mismatch.
     op.add_column("users", "phone", t.Text, nullable=True)
 ```
 
-### A.10 ユーザ定義 step (`op.step`) と PauseStep
+### A.10 User-defined step (`op.step`) and PauseStep
 
 ```python
 """Wait for replication lag before continuing."""
@@ -1876,5 +1908,3 @@ def upgrade():
 
     op.alter_column("users", "feature_flag", nullable=False)
 ```
-
-`PauseStep` で停止した migration は `joryu apply` の再実行で続きから（resume）。CI 等で「自動的に N 秒待ってから retry」したいなら `joryu apply --retry-paused --retry-interval=30s`。
