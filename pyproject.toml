@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "joryu"
+version = "0.1.0"
+description = "A SQLAlchemy-based Python migration library, intended as a modern alternative to Alembic."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "joryu contributors" }]
+dependencies = [
+    "sqlalchemy>=2.0",
+    "anyio>=4.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.1"]
+test-integration = [
+    "testcontainers>=4.0",
+    "psycopg[binary]>=3.1",
+    "pymysql>=1.1",
+]
+dev = [
+    "pytest>=8",
+    "pytest-anyio>=0.0.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+joryu = "joryu.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/joryu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
