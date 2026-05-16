@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.18"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,8 @@ name = "joryu"
 version = "0.1.0"
 description = "A SQLAlchemy-based Python migration library, intended as a modern alternative to Alembic."
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "joryu contributors" }]
 dependencies = [
     "sqlalchemy>=2.0",
