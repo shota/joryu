@@ -362,20 +362,52 @@ joryu deals with SQL across three layers:
 
 ### 6.3 Type compatibility
 
-The `joryu.types` module targets the cross-dialect lowest common denominator:
+The `joryu.types` module (conventionally imported as `t`) targets the cross-dialect lowest common denominator. Every type is a callable: `t.Text` (no params) and `t.String(255)` (with params) both produce a comparable type object.
 
-| `joryu.types` | Postgres | MySQL | SQLite |
+| `joryu.types` | Postgres | MySQL / MariaDB | SQLite |
 |---|---|---|---|
-| `Int`        | INTEGER | INT | INTEGER |
-| `BigInt`     | BIGINT  | BIGINT | INTEGER |
-| `Text`       | TEXT    | LONGTEXT | TEXT |
-| `Json`       | JSONB   | JSON | TEXT (JSON1) |
-| `Uuid`       | UUID    | CHAR(36) | TEXT |
-| `Timestamp`  | TIMESTAMPTZ | TIMESTAMP | TEXT (ISO8601) |
-| `Decimal(p,s)` | NUMERIC | DECIMAL | NUMERIC |
-| `Bool`       | BOOLEAN | TINYINT(1) | INTEGER |
+| `SmallInt`           | SMALLINT       | SMALLINT       | INTEGER |
+| `Int`                | INTEGER        | INT            | INTEGER |
+| `BigInt`             | BIGINT         | BIGINT         | INTEGER |
+| `Serial` / `BigSerial` | SERIAL / BIGSERIAL | INT AUTO_INCREMENT / BIGINT AUTO_INCREMENT | INTEGER PRIMARY KEY AUTOINCREMENT (see notes) |
+| `Float`              | REAL           | FLOAT          | REAL |
+| `Double`             | DOUBLE PRECISION | DOUBLE       | REAL |
+| `Decimal(p, s)`      | NUMERIC(p, s)  | DECIMAL(p, s)  | NUMERIC |
+| `Bool`               | BOOLEAN        | TINYINT(1)     | INTEGER (0/1) |
+| `String(n)`          | VARCHAR(n)     | VARCHAR(n)     | TEXT |
+| `Text`               | TEXT           | LONGTEXT       | TEXT |
+| `Binary(n=None)`     | BYTEA          | VARBINARY(n) / LONGBLOB | BLOB |
+| `Date`               | DATE           | DATE           | TEXT (ISO8601 `YYYY-MM-DD`) |
+| `Time`               | TIME           | TIME           | TEXT (ISO8601 `HH:MM:SS`) |
+| `Timestamp`          | TIMESTAMPTZ    | TIMESTAMP      | TEXT, format `YYYY-MM-DD HH:MM:SS` in UTC (SQLite's native `CURRENT_TIMESTAMP` form; same shape SQLite's date functions accept) |
+| `Interval`           | INTERVAL       | (unsupported — emits ERROR at apply time on MySQL/SQLite unless wrapped in a dialect branch) | (unsupported) |
+| `Json`               | JSONB          | JSON           | TEXT (JSON1 functions available) |
+| `Uuid`               | UUID           | CHAR(36)       | TEXT |
+| `Enum(*labels, name="…")` | native ENUM type (`CREATE TYPE`) | ENUM(...) inline | TEXT + CHECK constraint |
+| `Array(inner)`       | `inner[]`      | (unsupported — ERROR unless dialect-branched) | (unsupported) |
 
-For dialect-specific types use the escape `types.dialect("postgresql.tsvector")`.
+**Type-level modifiers** (chainable via keyword on the column op, not on the type object):
+
+| Modifier on `op.add_column(...)` | Meaning | Notes |
+|---|---|---|
+| `nullable=True\|False` | `NULL` / `NOT NULL` | Default `True` for new columns to keep them backfill-safe |
+| `default=<value>` | Default expressed as a Python constant | Rendered as a SQL literal of the matching type. Use for `0`, `False`, `""`, `"pending"`, etc. |
+| `server_default=<expr>` | Default expressed as a SQL expression | Accepts a string (passed verbatim), `t.now()`, or any `joryu` expression helper. Mutually exclusive with `default=` |
+| `generated="<sql>"` | `GENERATED ALWAYS AS (<sql>) STORED` | Postgres / MySQL only; SQLite supports STORED + VIRTUAL. Always a SQL expression string |
+| `primary_key=True` | Marks column as PK | Combine with `Serial` / `BigSerial` or `Uuid` for surrogate keys. Required when using `Serial` / `BigSerial` on any dialect (see notes) |
+| `unique=True` | Adds a unique index named `uq_<table>_<column>` | Override via `op.create_index(unique=True, name=...)` |
+| `comment="..."` | Column comment | Postgres / MySQL; silently dropped on SQLite |
+
+`default=` and `server_default=` are the only two ways to express a column default. There is no `server_default_fn=` keyword. Earlier draft examples in this document that show `server_default=op.func.now()` are equivalent to `server_default=t.now()`.
+
+**Notes**:
+- `Serial` / `BigSerial` require `primary_key=True` on every dialect joryu supports: SQLite has no standalone autoincrement; MySQL requires `AUTO_INCREMENT` columns to be a key. joryu enforces this at registration and raises `UnsupportedTypeUsage` otherwise (also covers MySQL where the user passed `primary_key=False` explicitly).
+- On SQLite the `Serial` mapping is `INTEGER PRIMARY KEY` (no `AUTOINCREMENT`). The `AUTOINCREMENT` keyword is intentionally omitted because it adds overhead (an extra `sqlite_sequence` table and a non-reusable rowid policy) for no gain in typical migration scenarios. Users who need monotonic guarantees across deletes must declare the type explicitly via `t.dialect("sqlite.integer_pk_autoincrement")`.
+- `Json` columns are stored as native JSON where available; on SQLite, the application is responsible for JSON validation, but `op` accepts `t.Json` and persists as `TEXT`.
+- `Enum` on Postgres creates a real type; rename / value-add must go through `op.declare_schema_change(enum_value_added=...)` (§12.2) for replay correctness. On MySQL the enum is inline so altering means a column alter. On SQLite the implementation emits a `CHECK (col IN (...))` constraint.
+- `Timestamp` on SQLite is stored as `YYYY-MM-DD HH:MM:SS` (space-separated, UTC). This matches what `CURRENT_TIMESTAMP` emits, keeping `default=t.now()` and explicit inserts in the same wire format. Applications wanting strict ISO8601-with-`T` must format on the application side. `default=t.now()` resolves to `CURRENT_TIMESTAMP` on SQLite/MySQL and `now() AT TIME ZONE 'UTC'` on Postgres.
+
+For dialect-specific types use the escape `t.dialect("postgresql.tsvector")` which produces a type object that errors on apply for the wrong dialect (so multi-dialect runs must wrap it in a `dialects=[...]` migration or an `op.execute({...})` branch).
 
 ### 6.4 Test strategy (two-tier: unit / integration)
 
@@ -475,6 +507,47 @@ Each Operation can statically enumerate its touched targets as `(table, column)`
 
 **Design rationale**: "no noise on normal workflows" is the top priority. Adding distinct columns to the same table — the common case — never trips this. Only genuinely dangerous combinations stop the build.
 
+#### 7.2.1 `Conflict` shape
+
+Every detected non-commutative pair surfaces as a `Conflict` object. `joryu verify` exits non-zero with `VerificationFailed(conflicts=[...])` when the list is non-empty.
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+ConflictKind = Literal[
+    "double_alter",      # two alter_column on the same column
+    "add_drop",          # add_column + drop_column on the same column
+    "table_drop",        # change to a table + drop_table on the same table
+    "column_rename",     # change to a column + rename_column
+    "table_rename",      # change to a table + rename_table
+]
+
+@dataclass(frozen=True)
+class OpRef:
+    migration_id: str          # e.g. "20260620T030000_backfill_email"
+    step_index: int            # 0-based position within the migration
+    op_kind: str               # e.g. "alter_column"
+    target: tuple[str, ...]    # canonical target tuple, e.g. ("users", "email") or ("users",)
+    source_line: int | None    # line in the migration file where the op was declared (best-effort)
+
+@dataclass(frozen=True)
+class Conflict:
+    kind: ConflictKind
+    left: OpRef
+    right: OpRef
+    message: str               # one-line human-readable summary, e.g.
+                               # 'alter_column(users.email) in 2026...A conflicts with
+                               #  rename_column(users.email -> users.email_norm) in 2026...B'
+```
+
+- `target` is normalized so commutativity checks are pure equality on the tuple. `("users", "email")` for a column op; `("users",)` for a table op.
+- `left` is always the earlier op under the ordering `(migration_id, step_index)` compared as `(str, int)` (lexicographic on the id; numeric on the step index — *not* lexicographic on a stringified step index, so step 10 is ordered after step 9).
+- Conflict-kind priority when a pair could match more than one rule: `table_drop` > `table_rename` > `add_drop` > `column_rename` > `double_alter`. Concretely, if `drop_table(users)` and `drop_column(users.email)` are both present in parallel migrations, the emitted kind is `table_drop`, not `add_drop` — only one `Conflict` per ordered op pair is emitted.
+- The taxonomy covers only statically analyzable ops. Pairs where either side is `op.execute(raw)` or `op.run_python(...)` are not produced as `Conflict` objects (the "silent" row in the table above); they remain human-review responsibility.
+- `Conflict.__str__` returns `message`. `VerificationFailed.__str__` joins all conflict messages with newlines for use as a CI error summary.
+- The names `Conflict`, `OpRef`, `ConflictKind`, and `VerificationFailed` are all importable from the top-level `joryu` package for use in CI scripts and isinstance checks.
+
 ### 7.3 Ordering guarantee — `depends_on`
 
 - If you need ordering, set `migration.depends_on = ["predecessor id", ...]`.
@@ -543,32 +616,82 @@ Alembic's `--autogenerate` requires a DB, which makes CI use awkward. joryu supp
 
 ### 9.2 State tables
 
+Two tables hold all joryu runtime state. Both live in the user's application database (the same one being migrated). On Postgres, state updates can share a transaction with DDL/DML; on MySQL and SQLite, atomicity between state writes and step effects is impossible (MySQL implicitly commits on DDL; SQLite has no DDL-inside-transaction guarantee across all op types). joryu relies on ensure-style idempotency (§9.4) — not transactional atomicity — for crash safety on those dialects.
+
 ```sql
 CREATE TABLE joryu_migrations (
-    id              VARCHAR(120) PRIMARY KEY,
-    checksum        VARCHAR(80)  NOT NULL,
-    status          VARCHAR(20)  NOT NULL,     -- 'running' | 'applied' | 'failed'
+    id              VARCHAR(120) PRIMARY KEY,    -- migration id from @joryu.migration(id=...)
+    checksum        VARCHAR(80)  NOT NULL,       -- SHA-256 hex of the canonical op sequence
+    status          VARCHAR(20)  NOT NULL,       -- enum: see below
     started_at      TIMESTAMP    NOT NULL,
     finished_at     TIMESTAMP    NULL,
-    joryu_version   VARCHAR(20)  NOT NULL,
-    dialect         VARCHAR(20)  NOT NULL
+    joryu_version   VARCHAR(20)  NOT NULL,       -- joryu library version that produced the row
+    dialect         VARCHAR(20)  NOT NULL,       -- 'postgresql' | 'mysql' | 'mariadb' | 'sqlite'
+    last_error      TEXT         NULL,           -- exception summary, populated when status='failed'
+    pause_reason    TEXT         NULL            -- PauseStep.reason, populated when status='paused'
 );
 
+CREATE INDEX idx_joryu_migrations_status ON joryu_migrations (status);
+-- supports `joryu status` and the halt check ("any failed/paused?").
+
 CREATE TABLE joryu_migration_steps (
-    migration_id    VARCHAR(120) NOT NULL,
-    step_index      INTEGER      NOT NULL,
-    op_fingerprint  VARCHAR(80)  NOT NULL,     -- hash of op kind and arguments
-    status          VARCHAR(20)  NOT NULL,     -- 'running' | 'done' | 'failed'
+    migration_id    VARCHAR(120) NOT NULL,       -- FK -> joryu_migrations.id (not enforced on SQLite)
+    step_index      INTEGER      NOT NULL,       -- 0-based position in the registered step list
+    op_kind         VARCHAR(40)  NOT NULL,       -- 'add_column' | 'run_python' | 'step' | ...
+    op_fingerprint  VARCHAR(80)  NOT NULL,       -- SHA-256 hex of (op_kind, normalized args)
+    status          VARCHAR(20)  NOT NULL,       -- enum: see below
     started_at      TIMESTAMP    NOT NULL,
     finished_at     TIMESTAMP    NULL,
-    progress        TEXT         NULL,         -- checkpoint state, etc.
+    progress        TEXT         NULL,           -- JSON: checkpoint state (§13.3)
     PRIMARY KEY (migration_id, step_index)
 );
 ```
 
+**`joryu_migrations.status` enum** (string values, validated by application code):
+
+| Value | Meaning | Terminal? |
+|---|---|---|
+| `pending` | Only present when explicitly written by `joryu mark --as=pending` (a recovery escape hatch). The normal lifecycle never persists this value — a not-yet-attempted migration is represented by row absence | no |
+| `running` | An apply is in progress and currently holds the advisory lock | no |
+| `applied` | Migration completed successfully | yes |
+| `failed` | A step raised an uncaught exception. `last_error` is set | no — recoverable via `joryu mark` / fix + re-apply |
+| `paused` | A step raised `PauseStep`. `pause_reason` is set | no — recoverable via re-apply or `--retry-paused` |
+
+Allowed transitions:
+
+- (no row) → `running` (apply discovers a new migration and inserts the row at start)
+- `running` → `applied | failed | paused` (terminal-for-this-attempt)
+- `failed | paused | pending` → `running` (retry; the row is updated in place)
+- `failed | paused` → `applied` (via `joryu mark --as=applied` after manual fix; intended for operators who completed the work out-of-band)
+- any state → `pending` (via `joryu mark --as=pending` only; the explicit recovery escape hatch — never produced by normal flow)
+
+On every transition *out of* `failed` or `paused` (including via retry to `running` or via `joryu mark`), joryu sets `last_error = NULL` and `pause_reason = NULL`. A row with `status='applied'` therefore never carries error metadata.
+
+`last_error` content: the first 4 KB of `f"{type(exc).__name__}: {exc}"`, with a single newline-separated traceback summary (top frame + bottom frame) appended if the exception had a `__traceback__`. The full exception is *not* stored — operators get the summary in `joryu status`, and the live `MigrationFailed.cause` carries the rich object during the failing run.
+
+**`joryu_migration_steps.status` enum**:
+
+| Value | Meaning |
+|---|---|
+| `pending` | Not yet attempted, or attempted and returned `False` (retry next apply), or raised `PauseStep` (the parent migration carries the `paused` flag and `pause_reason`) |
+| `running` | Currently executing |
+| `done` | Completed successfully |
+| `failed` | Raised an uncaught exception |
+| `skipped` | Raised `SkipStep`, or marked skipped via `joryu mark <id>.<step>` |
+
+Step-level `paused` is *not* a separate status: the step stays `pending` and the parent migration row carries the pause signal. The "pause point" — i.e. which step raised `PauseStep` — is recoverable as `MIN(step_index)` of the pending steps in that migration.
+
+`joryu mark <id>.<step> --as=pending` on a step belonging to an `applied` migration automatically downgrades the migration to `failed` (with `last_error` set to a synthetic message explaining the manual rewind). This prevents the inconsistent state of an `applied` migration containing a `pending` step.
+
+**Operational invariants**:
+
 - A migration with `status='applied'` is never re-executed (same as Alembic).
-- `status='running'` or `'failed'` is a resume target. Replay from the first non-`done` step using `joryu_migration_steps`.
-- `op_fingerprint` detects code edits at resume time (a different op at the same index is ERROR).
+- `status='running'` / `'failed'` / `'paused'` is a resume target. Apply replays from the first non-`done` step using `joryu_migration_steps`.
+- `op_fingerprint` detects code edits at resume time: if a step that is already `done` would now hash differently, `joryu apply` aborts before touching the DB (see §10.4).
+- `op_kind` is denormalized from the operation so that `joryu status` and history queries do not need to re-parse the migration file.
+- `started_at` / `finished_at` use the connection's server clock (`CURRENT_TIMESTAMP`) rather than the client clock, so multiple machines stay comparable.
+- `progress` is JSON text. The serialization rules and size limit are in §13.3.
+- All writes to either table happen inside the application transaction when the dialect supports transactional DDL (Postgres). For MySQL / SQLite under `per_step` mode, joryu commits the state row immediately after each step's effects so a crash never leaves the row out of sync with the DB.
 
 ### 9.3 Transaction mode (three choices)
 
@@ -927,7 +1050,7 @@ def upgrade():
 
     op.execute("ALTER TABLE users ADD COLUMN api_key TEXT GENERATED ALWAYS AS (...) STORED")
     op.declare_schema_change(
-        column_added=("users", "api_key", t.Text, {"nullable": False, "generated": True})
+        column_added=("users", "api_key", t.Text, {"nullable": False, "generated": "lower(email)"})
     )
 
     def transform(conn, dialect, checkpoint):
@@ -963,10 +1086,12 @@ def upgrade():
 This vocabulary is frozen in v1 (no breaking changes). Backward-compatible additions are allowed. Multiple keywords can be passed in one call:
 ```python
 op.declare_schema_change(
-    column_added=("users", "api_key", t.Text, {"nullable": False, "generated": True}),
+    column_added=("users", "api_key", t.Text, {"nullable": False, "generated": "lower(email)"}),
     index_added=("idx_users_api_key", "users", ["api_key"], {"unique": True}),
 )
 ```
+
+The `opts` dict in the column tuple uses the same keyword set as `op.add_column(...)` (see §6.3): `nullable`, `default`, `server_default`, `generated`, `primary_key`, `unique`, `comment`. `generated` is always a SQL expression *string* — never a boolean.
 
 Tuple shape per keyword:
 
@@ -1430,8 +1555,10 @@ joryu down [--steps=N | --to=<id>] [--allow-prod]   # dev-only; production-like 
 joryu schema-snapshot [--format=json|sql]           # emit the current schema for AI assistance
 joryu verify                            # CI: mutation detection + semantic conflict detection (§7)
 joryu repair <id>                       # update the checksum of an applied migration
-joryu mark <id> --as=applied|pending|failed       # manual state correction (last resort)
-joryu mark <id>.<step> --as=done|pending|skipped  # correct an individual step
+joryu mark <id> --as=applied|pending|failed|paused   # manual state correction (last resort)
+                                                     #   --as=paused requires --reason="..."
+joryu mark <id>.<step> --as=done|pending|skipped     # correct an individual step
+                                                     #   marking a step inside an applied migration downgrades the parent to failed
 joryu show <id>                         # show details
 joryu explain <id>                      # natural-language rendering (AI assistance)
 joryu test [--unit | --integration] [--dialects=postgresql,mysql,sqlite]
@@ -1477,6 +1604,7 @@ Shared by CLI and API:
 | `3` | Migration paused (`PauseStep` raised, or still paused after `--retry-paused`, or halted by an existing paused migration) | `MigrationPaused` |
 | `4` | Verify failure (drift / conflict detected) | `VerificationFailed` |
 | `5` | Rejected by production guard (production detected, `--allow-prod` not passed) | `ProductionGuardError` |
+| `6` | Type used incorrectly for the active dialect (e.g. `Serial` without `primary_key=True`, `Interval` on SQLite) | `UnsupportedTypeUsage` |
 
 ### 16.3 Public exception classes
 
@@ -1487,8 +1615,12 @@ joryu.JoryuError                     # base of every exception
 ├── MigrationFailed(migration_id, step_index, step_name, cause)
 ├── MigrationPaused(migration_id, step_index, step_name, reason)
 ├── VerificationFailed(conflicts: list[Conflict])
-└── ProductionGuardError(detected_env: Literal["staging", "production", "production-like"], host: str | None)
+├── ProductionGuardError(detected_env: Literal["staging", "production", "production-like"], host: str | None)
+└── UnsupportedTypeUsage(message)    # raised at registration when a type is used incorrectly for a dialect
+                                      #   (e.g. Serial without primary_key=True, Interval on SQLite)
 ```
+
+Supporting types also importable from `joryu`: `Conflict`, `OpRef`, `ConflictKind` (see §7.2.1).
 
 - `MigrationFailed.cause` holds the original exception as an attribute (not just via exception chaining).
 - `MigrationPaused` is raised at the top level when `PauseStep` is *raised* from inside `op.step` or `op.run_python` (paired with the step-level signal in §13.2.2; `PauseStep` is never returned, only raised).
